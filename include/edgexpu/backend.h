@@ -9,11 +9,30 @@
 extern "C" {
 #endif
 
+typedef enum edgexpu_cpu_path {
+    EDGEXPU_CPU_PATH_AUTO = 0,
+    EDGEXPU_CPU_PATH_NATIVE = 1,
+    EDGEXPU_CPU_PATH_LLAMA_BOOTSTRAP = 2
+} edgexpu_cpu_path;
+
 typedef struct edgexpu_generation_request {
     const char *prompt;
     int max_tokens;
     float temperature;
+    edgexpu_cpu_path cpu_path;
 } edgexpu_generation_request;
+
+typedef struct edgexpu_backend_telemetry {
+    char backend[EDGEXPU_TEXT_SMALL];
+    char device[EDGEXPU_TEXT_SMALL];
+    char fallback_reason[EDGEXPU_TEXT_MEDIUM];
+    double total_seconds;
+    double prefill_seconds;
+    double decode_seconds;
+    int prompt_tokens_approx;
+    int completion_tokens_approx;
+    int memory_used_mb;
+} edgexpu_backend_telemetry;
 
 typedef struct edgexpu_generation_result {
     char text[EDGEXPU_TEXT_LARGE];
@@ -21,6 +40,7 @@ typedef struct edgexpu_generation_result {
     double elapsed_seconds;
     int prompt_tokens_approx;
     int completion_tokens_approx;
+    edgexpu_backend_telemetry telemetry;
 } edgexpu_generation_result;
 
 typedef struct edgexpu_backend {
@@ -38,7 +58,7 @@ typedef struct edgexpu_backend {
 
     /* 执行一次生成。
      * 当前同步接口是 MVP 门面；后续内部应拆成异步 load/prefill/decode/KV/stream jobs，
-     * 由调度器在 CPU、NPU、GPU 和 flash/memory 管线之间编排。
+     * 由调度器在 CPU、NPU、dNPU 和 flash/memory 管线之间编排。
      */
     int (*generate)(
         const edgexpu_generation_request *request,

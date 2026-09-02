@@ -10,7 +10,7 @@
       "content": "Explain what EdgeXPU-LLM is in one sentence."
     }
   ],
-  "max_tokens": 64,
+  "max_tokens": 16,
   "temperature": 0.7,
   "stream": false
 }

@@ -380,12 +380,46 @@ int edgexpu_executor_has_pending(const edgexpu_executor *executor) {
     return edgexpu_executor_count_by_status(executor, EDGEXPU_EXECUTOR_JOB_PENDING) > 0;
 }
 
+size_t edgexpu_executor_remaining_capacity(const edgexpu_executor *executor) {
+    if (executor == NULL || executor->job_count >= EDGEXPU_EXECUTOR_MAX_JOBS) {
+        return 0;
+    }
+
+    return EDGEXPU_EXECUTOR_MAX_JOBS - executor->job_count;
+}
+
+void edgexpu_executor_drop_terminal(edgexpu_executor *executor) {
+    size_t read_index;
+    size_t write_index = 0;
+
+    if (executor == NULL) {
+        return;
+    }
+
+    for (read_index = 0; read_index < executor->job_count; read_index++) {
+        edgexpu_executor_job_status status = executor->jobs[read_index].status;
+        if (status == EDGEXPU_EXECUTOR_JOB_PENDING || status == EDGEXPU_EXECUTOR_JOB_RUNNING) {
+            if (write_index != read_index) {
+                executor->jobs[write_index] = executor->jobs[read_index];
+            }
+            write_index++;
+        }
+    }
+
+    if (write_index < executor->job_count) {
+        memset(&executor->jobs[write_index], 0, sizeof(executor->jobs[0]) * (executor->job_count - write_index));
+    }
+    executor->job_count = write_index;
+}
+
 const char *edgexpu_executor_job_type_name(edgexpu_executor_job_type type) {
     switch (type) {
         case EDGEXPU_EXECUTOR_JOB_LOAD_MODEL:
             return "load_model";
         case EDGEXPU_EXECUTOR_JOB_PREPARE_PROMPT:
             return "prepare_prompt";
+        case EDGEXPU_EXECUTOR_JOB_TOKENIZE:
+            return "tokenize";
         case EDGEXPU_EXECUTOR_JOB_PREFILL:
             return "prefill";
         case EDGEXPU_EXECUTOR_JOB_DECODE_STEP:

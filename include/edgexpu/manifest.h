@@ -28,6 +28,7 @@ typedef struct edgexpu_model_manifest {
     int memory_required_mb;
     int kv_cache_required_mb;
     char fallback_policy[EDGEXPU_TEXT_SMALL];
+    char chat_template[EDGEXPU_TEXT_LARGE];
     edgexpu_model_artifact primary_artifact;
 } edgexpu_model_manifest;
 

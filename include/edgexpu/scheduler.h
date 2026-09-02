@@ -12,6 +12,13 @@
 extern "C" {
 #endif
 
+typedef struct edgexpu_schedule_native_ready {
+    int loader;
+    int tokenizer;
+    int kernel;
+    int kv;
+} edgexpu_schedule_native_ready;
+
 typedef struct edgexpu_schedule_decision {
     edgexpu_executor_job_type job_type;
     char backend[EDGEXPU_TEXT_SMALL];
@@ -39,6 +46,17 @@ int edgexpu_scheduler_plan_job(
 int edgexpu_scheduler_plan_job_with_profile(
     const edgexpu_model_manifest *manifest,
     const edgexpu_device_profile *profile,
+    edgexpu_executor_job_type job_type,
+    edgexpu_schedule_decision *decision,
+    char *error,
+    size_t error_size
+);
+
+int edgexpu_scheduler_plan_job_with_context(
+    const edgexpu_model_manifest *manifest,
+    const edgexpu_device_profile *profile,
+    const edgexpu_backend_telemetry *last_telemetry,
+    const edgexpu_schedule_native_ready *native,
     edgexpu_executor_job_type job_type,
     edgexpu_schedule_decision *decision,
     char *error,

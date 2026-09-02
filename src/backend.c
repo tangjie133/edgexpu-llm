@@ -437,6 +437,20 @@ static int cpu_baseline_generate(
         return 0;
     }
 
+    snprintf(result->telemetry.backend, sizeof(result->telemetry.backend), "%s", result->backend);
+    snprintf(result->telemetry.device, sizeof(result->telemetry.device), "cpu");
+    snprintf(
+        result->telemetry.fallback_reason,
+        sizeof(result->telemetry.fallback_reason),
+        "temporary llama.cpp bootstrap backend; native tokenizer/prefill/decode are not connected yet"
+    );
+    result->telemetry.total_seconds = result->elapsed_seconds;
+    result->telemetry.prefill_seconds = 0.0;
+    result->telemetry.decode_seconds = result->elapsed_seconds;
+    result->telemetry.prompt_tokens_approx = result->prompt_tokens_approx;
+    result->telemetry.completion_tokens_approx = result->completion_tokens_approx;
+    result->telemetry.memory_used_mb = 0;
+
     return 1;
 }
 

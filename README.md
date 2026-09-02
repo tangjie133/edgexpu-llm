@@ -17,7 +17,7 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 - 原生模型加载和 artifact 管理
 - CPU operator 执行和 fallback kernel
 - NPU/dNPU backend adapter
-- 异步 load、prefill、decode、KV cache、memory、flash、stream job
+- 异步 load、tokenize、prefill、decode、KV cache、memory、flash、stream job
 - CPU、NPU、dNPU、memory、storage 之间的分阶段调度
 - backend 无关的 telemetry 和 benchmark trace
 
@@ -32,15 +32,21 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 - 设备能力 profiler
 - 简单 backend selector
 - Phase 2 async executor contract、单线程 job queue 和 benchmark trace 最小闭环
+- Phase 3 Native CPU Runtime：有限 GGUF loader、CPU kernel、内部 executor；默认走 native CPU fallback，`compare` 与 llama bootstrap 同模型对比
 - 通过 `llama`、`llama-cli`、`powerinfer` 或 `main` 调用的临时 CPU baseline backend
 - 带 stage trace 和 executor trace 的 benchmark 命令
 - 带 queue summary 和 scheduler policy 的 `trace` 调试命令
-- `executor-selftest` 队列自测命令
+- `executor-selftest`、`scheduler-selftest`、`native-selftest` 自测命令
+- `inspect-gguf` 和 `tokenize` 调试命令
+- backend-owned telemetry 第一版，并已作为下一次 scheduler plan 的输入
 - 本地 OpenAI-compatible `/v1/models` 和 `/v1/chat/completions` server
-- Qwen2.5 0.5B 示例 manifest 和 request body
+- streaming 请求会按每个 native token 发送 SSE chunk
+- Qwen2.5 0.5B 参考模型包，以及 SmolLM2-135M 替换验证包（只换 manifest）
+- GGUF `general.architecture` adapter（RoPE / QKV bias / FFN / tokenizer）
+- 模型包 `chat_template`，runtime 不写死 chat 标记
 - MVP 验证脚本 `scripts/verify_mvp.sh`
 
-本地 benchmark 路径已经用 GGUF 模型和新版 `llama cli` 命令验证通过。当前 backend 会清理 CLI wrapper 输出，使 benchmark 和 API response 只包含模型生成文本。runtime 现在会通过单线程 runnable executor queue 执行 load、prefill、decode、KV cache、stream 和 telemetry job，benchmark 会输出带 queue summary、scheduler policy 和 `scheduler_reason` 的 `executor_trace`，用于验证 Phase 2 的最小闭环。
+本地 benchmark 路径已经用 GGUF 模型和 native CPU prefill/decode 验证通过。runtime 通过单线程 runnable executor queue 执行 load、tokenize、prefill、decode、KV cache、stream 和 telemetry job。`tokenize` 走 native GGUF BPE tokenizer；`prefill` 跑完全部 transformer 层并写入 KV；每个生成 token 对应一次 native `decode_step` 和一次 `stream_token`。`llama cli` 仅在 native session 未就绪时作为后备。benchmark 会输出 `backend_telemetry`（含 prefill/decode 分项时间）、queue summary、scheduler policy 和 `executor_trace`。
 
 ## 总体架构
 
@@ -109,6 +115,7 @@ Flash 和模型驻留：
 ```text
 loadModelArtifact
 preparePrompt
+tokenize
 prefill
 decodeStep
 updateKvCache
@@ -275,6 +282,12 @@ docs/windows-mingw-setup.md
 ./build/edgexpu benchmark examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
 ```
 
+同模型对比 native CPU fallback 与 llama bootstrap：
+
+```bash
+./build/edgexpu compare examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
+```
+
 查看 executor trace：
 
 ```bash
@@ -285,6 +298,22 @@ docs/windows-mingw-setup.md
 
 ```bash
 ./build/edgexpu executor-selftest
+```
+
+运行 scheduler 自测：
+
+```bash
+./build/edgexpu scheduler-selftest
+```
+
+查看 GGUF 元数据和 native tokenizer：
+
+```bash
+./build/edgexpu inspect-gguf examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/edgexpu tokenize examples/models/qwen2.5-0.5b/model.manifest.json "Hello EdgeXPU"
+./build/edgexpu native-selftest examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/edgexpu inspect-gguf examples/models/smollm2-135m/smollm2-135m-instruct-q4_k_m.gguf
+./build/edgexpu tokenize examples/models/smollm2-135m/model.manifest.json "Hello EdgeXPU"
 ```
 
 启动本地 API server：

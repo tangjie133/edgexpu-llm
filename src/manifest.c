@@ -67,8 +67,7 @@ static int extract_string(
     char pattern[128];
     const char *cursor;
     const char *start;
-    const char *end;
-    size_t length;
+    size_t used = 0;
 
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     cursor = strstr(json, pattern);
@@ -87,19 +86,43 @@ static int extract_string(
     }
     start++;
 
-    end = strchr(start, '"');
-    if (end == NULL) {
-        return 0;
+    while (*start != '\0' && *start != '"') {
+        unsigned char ch;
+        if (*start == '\\') {
+            start++;
+            if (*start == '\0') {
+                return 0;
+            }
+            switch (*start) {
+                case 'n':
+                    ch = '\n';
+                    break;
+                case 'r':
+                    ch = '\r';
+                    break;
+                case 't':
+                    ch = '\t';
+                    break;
+                case '"':
+                case '\\':
+                case '/':
+                    ch = (unsigned char)*start;
+                    break;
+                default:
+                    ch = (unsigned char)*start;
+                    break;
+            }
+            start++;
+        } else {
+            ch = (unsigned char)*start++;
+        }
+        if (used + 1 >= output_size) {
+            break;
+        }
+        output[used++] = (char)ch;
     }
-
-    length = (size_t)(end - start);
-    if (length >= output_size) {
-        length = output_size - 1;
-    }
-
-    memcpy(output, start, length);
-    output[length] = '\0';
-    return 1;
+    output[used] = '\0';
+    return *start == '"' || used > 0;
 }
 
 static int extract_int(const char *json, const char *key, int *output) {
@@ -237,6 +260,7 @@ int edgexpu_manifest_load(
     extract_int(json, "kv_cache_required_mb", &manifest->kv_cache_required_mb);
     extract_string(json, "quantization", manifest->primary_artifact.quantization, sizeof(manifest->primary_artifact.quantization));
     extract_string(json, "command", manifest->primary_artifact.command, sizeof(manifest->primary_artifact.command));
+    extract_string(json, "chat_template", manifest->chat_template, sizeof(manifest->chat_template));
 
     if (!resolve_artifact_path(path, manifest->primary_artifact.path, sizeof(manifest->primary_artifact.path), error, error_size)) {
         free(json);
@@ -257,6 +281,7 @@ void edgexpu_manifest_print(const edgexpu_model_manifest *manifest) {
     printf("parameter_size: %s\n", manifest->parameter_size);
     printf("context_length: %d\n", manifest->context_length);
     printf("fallback_policy: %s\n", manifest->fallback_policy);
+    printf("chat_template_bytes: %zu\n", strlen(manifest->chat_template));
     printf("artifact.backend: %s\n", manifest->primary_artifact.backend);
     printf("artifact.path: %s\n", manifest->primary_artifact.path);
     printf("artifact.format: %s\n", manifest->primary_artifact.format);

@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define EDGEXPU_EXECUTOR_MAX_JOBS 64
+#define EDGEXPU_EXECUTOR_MAX_JOBS 256
 
 typedef struct edgexpu_executor_job edgexpu_executor_job;
 
@@ -24,6 +24,7 @@ typedef int (*edgexpu_executor_job_callback)(
 typedef enum edgexpu_executor_job_type {
     EDGEXPU_EXECUTOR_JOB_LOAD_MODEL = 0,
     EDGEXPU_EXECUTOR_JOB_PREPARE_PROMPT,
+    EDGEXPU_EXECUTOR_JOB_TOKENIZE,
     EDGEXPU_EXECUTOR_JOB_PREFILL,
     EDGEXPU_EXECUTOR_JOB_DECODE_STEP,
     EDGEXPU_EXECUTOR_JOB_UPDATE_KV_CACHE,
@@ -172,6 +173,11 @@ size_t edgexpu_executor_count_by_status(
 );
 
 int edgexpu_executor_has_pending(const edgexpu_executor *executor);
+
+size_t edgexpu_executor_remaining_capacity(const edgexpu_executor *executor);
+
+/* 丢掉 completed/failed job，给后续 generate 或 token stream 腾出固定容量队列。 */
+void edgexpu_executor_drop_terminal(edgexpu_executor *executor);
 
 const char *edgexpu_executor_job_type_name(edgexpu_executor_job_type type);
 const char *edgexpu_executor_job_status_name(edgexpu_executor_job_status status);

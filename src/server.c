@@ -253,36 +253,78 @@ static void send_chat_response(
     send_json_response(client, 200, "OK", body);
 }
 
-static void send_stream_response(
-    edgexpu_socket_t client,
-    const edgexpu_runtime *runtime,
-    const edgexpu_generation_result *result
-) {
-    char header[256];
-    char escaped_text[EDGEXPU_TEXT_LARGE * 2];
-    char event[EDGEXPU_TEXT_LARGE * 2 + 1024];
-    long created = (long)time(NULL);
+static void send_sse_chunk(edgexpu_socket_t client, const char *payload) {
+    send_all(client, "data: ");
+    send_all(client, payload);
+    send_all(client, "\n\n");
+}
 
-    (void)runtime;
-    snprintf(
-        header,
-        sizeof(header),
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
-    );
-    send_all(client, header);
+static void send_stream_role_chunk(edgexpu_socket_t client, const char *model_id, long created) {
+    char event[1024];
 
-    json_escape(result->text, escaped_text, sizeof(escaped_text));
     snprintf(
         event,
         sizeof(event),
-        "data: {\"id\":\"chatcmpl-edgexpu\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
-        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+        "{\"id\":\"chatcmpl-edgexpu\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
+        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
         created,
-        runtime->manifest.model_id,
+        model_id
+    );
+    send_sse_chunk(client, event);
+}
+
+static void send_stream_token_chunk(
+    edgexpu_socket_t client,
+    const char *model_id,
+    long created,
+    const char *token
+) {
+    char escaped_text[EDGEXPU_TEXT_SMALL * 2];
+    char event[EDGEXPU_TEXT_SMALL * 2 + 512];
+
+    json_escape(token, escaped_text, sizeof(escaped_text));
+    snprintf(
+        event,
+        sizeof(event),
+        "{\"id\":\"chatcmpl-edgexpu\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
+        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
+        created,
+        model_id,
         escaped_text
     );
-    send_all(client, event);
-    send_all(client, "data: [DONE]\n\n");
+    send_sse_chunk(client, event);
+}
+
+static void send_stream_finish_chunk(edgexpu_socket_t client, const char *model_id, long created) {
+    char event[1024];
+
+    snprintf(
+        event,
+        sizeof(event),
+        "{\"id\":\"chatcmpl-edgexpu\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
+        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        created,
+        model_id
+    );
+    send_sse_chunk(client, event);
+}
+
+typedef struct sse_stream_state {
+    edgexpu_socket_t client;
+    const char *model_id;
+    long created;
+} sse_stream_state;
+
+static void sse_on_token(const char *token, int token_index, int token_count, void *user_data) {
+    sse_stream_state *state = (sse_stream_state *)user_data;
+
+    (void)token_index;
+    (void)token_count;
+    if (state == NULL || token == NULL || token[0] == '\0') {
+        return;
+    }
+
+    send_stream_token_chunk(state->client, state->model_id, state->created, token);
 }
 
 static void handle_chat_completion(edgexpu_socket_t client, edgexpu_runtime *runtime, const char *body) {
@@ -297,21 +339,53 @@ static void handle_chat_completion(edgexpu_socket_t client, edgexpu_runtime *run
         return;
     }
 
+    memset(&request, 0, sizeof(request));
     request.prompt = prompt;
     request.max_tokens = extract_json_int(body, "max_tokens", 128);
     temperature_milli = extract_json_float_milli(body, "temperature", 0);
     request.temperature = (float)temperature_milli / 1000.0f;
+
+    if (request_wants_stream(body)) {
+        sse_stream_state stream_state;
+        char header[256];
+        long created = (long)time(NULL);
+
+        snprintf(
+            header,
+            sizeof(header),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        );
+        send_all(client, header);
+
+        stream_state.client = client;
+        stream_state.model_id = runtime->manifest.model_id;
+        stream_state.created = created;
+        send_stream_role_chunk(client, runtime->manifest.model_id, created);
+
+        if (!edgexpu_runtime_generate_stream(
+                runtime,
+                &request,
+                &result,
+                sse_on_token,
+                &stream_state,
+                error,
+                sizeof(error))) {
+            send_sse_chunk(client, "{\"error\":{\"message\":\"generation failed\",\"type\":\"edgexpu_error\"}}");
+            send_sse_chunk(client, "[DONE]");
+            return;
+        }
+
+        send_stream_finish_chunk(client, runtime->manifest.model_id, created);
+        send_sse_chunk(client, "[DONE]");
+        return;
+    }
 
     if (!edgexpu_runtime_generate(runtime, &request, &result, error, sizeof(error))) {
         send_error(client, 500, "Internal Server Error", error);
         return;
     }
 
-    if (request_wants_stream(body)) {
-        send_stream_response(client, runtime, &result);
-    } else {
-        send_chat_response(client, runtime, &result);
-    }
+    send_chat_response(client, runtime, &result);
 }
 
 static void handle_client(edgexpu_socket_t client, edgexpu_runtime *runtime) {

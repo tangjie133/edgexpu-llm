@@ -10,7 +10,7 @@
       "content": "Explain EdgeXPU-LLM streaming in one short sentence."
     }
   ],
-  "max_tokens": 32,
+  "max_tokens": 8,
   "temperature": 0.3,
   "stream": true
 }
