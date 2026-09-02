@@ -1,0 +1,24 @@
+{
+  "model_id": "qwen2.5-0.5b",
+  "family": "qwen2.5",
+  "parameter_size": "0.5B",
+  "context_length": 32768,
+  "supported_tasks": ["chat"],
+  "memory_required_mb": 1024,
+  "kv_cache_required_mb": 512,
+  "fallback_policy": "cpu.baseline",
+  "artifacts": [
+    {
+      "backend": "cpu.baseline",
+      "path": "cpu/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "format": "gguf",
+      "quantization": "Q4_K_M",
+      "command": "llama-cli",
+      "args": []
+    }
+  ],
+  "expected_throughput": {
+    "prefill_tokens_per_second": null,
+    "decode_tokens_per_second": null
+  }
+}

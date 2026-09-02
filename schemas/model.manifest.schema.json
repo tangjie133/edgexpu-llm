@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://edgexpu.local/schemas/model.manifest.schema.json",
+  "title": "EdgeXPU Model Manifest",
+  "type": "object",
+  "required": [
+    "model_id",
+    "family",
+    "parameter_size",
+    "context_length",
+    "fallback_policy",
+    "artifacts"
+  ],
+  "properties": {
+    "model_id": { "type": "string" },
+    "family": { "type": "string" },
+    "parameter_size": { "type": "string" },
+    "context_length": { "type": "integer", "minimum": 1 },
+    "supported_tasks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["chat"]
+    },
+    "memory_required_mb": { "type": ["integer", "null"], "minimum": 1 },
+    "kv_cache_required_mb": { "type": ["integer", "null"], "minimum": 1 },
+    "fallback_policy": {
+      "type": "string",
+      "enum": ["cpu.baseline", "cpu.llama_cpp", "rockchip.rkllm", "qualcomm.qnn"]
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["backend", "path", "format"],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "enum": ["cpu.baseline", "cpu.llama_cpp", "rockchip.rkllm", "qualcomm.qnn"]
+          },
+          "path": { "type": "string" },
+          "format": { "type": "string" },
+          "quantization": { "type": ["string", "null"] },
+          "command": { "type": ["string", "null"] },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "expected_throughput": {
+      "type": ["object", "null"],
+      "properties": {
+        "prefill_tokens_per_second": { "type": ["number", "null"] },
+        "decode_tokens_per_second": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,19 +1,77 @@
 # EdgeXPU-LLM
 
-EdgeXPU-LLM is a proposed offline, edge-native LLM inference framework for ARM-based devices with heterogeneous accelerators. The current design focuses on Rockchip RK3588/RK3576 and Qualcomm Snapdragon/Dragonwing platforms, with ARM CPU fallback. STM32-class targets are intentionally excluded from this first framework draft.
+EdgeXPU-LLM is an offline, edge-native LLM inference framework for ARM-based devices with heterogeneous accelerators. The current design focuses on Rockchip RK3588/RK3576 and Qualcomm Snapdragon/Dragonwing platforms, with ARM CPU fallback. STM32-class targets are intentionally excluded from this first framework draft.
 
 The goal is not to copy cloud GPU inference stacks onto smaller hardware. The goal is to build a local runtime that understands edge constraints: NPU execution limits, CPU/NPU/GPU heterogeneity, unified memory bandwidth, flash storage, quantization formats, KV cache pressure, and privacy-sensitive workloads.
+
+## Positioning Boundary
+
+EdgeXPU-LLM is not intended to be a thin wrapper around `llama.cpp`.
+
+In the MVP, `llama.cpp` is used only as the CPU baseline backend because it is practical on development machines and Raspberry Pi devices. The framework's intended innovation sits above and around individual inference engines:
+
+- a portable model artifact contract across GGUF, RKLLM, QNN, ONNX Runtime GenAI, and ExecuTorch
+- runtime capability profiling for edge devices
+- stage-aware scheduling for prefill, decode, verification, and agent workloads
+- KV cache, prompt cache, memory, and flash-aware execution policies
+- backend-independent telemetry and benchmark data for future NPU routing
+
+If the project only exposes `llama.cpp` through an OpenAI-compatible API, it should be considered a baseline adapter rather than the core EdgeXPU-LLM framework.
+
+## Implementation Direction
+
+The EdgeXPU-LLM runtime follows a PowerInfer-style native implementation model, not a Python application-server model.
+
+Reference implementation shape:
+
+- C core runtime built with CMake
+- local CLI and local serving binary
+- Python limited to helper scripts such as model conversion, profiling, or packaging
+- model formats derived from GGUF / PowerInfer GGUF concepts where appropriate
+- activation profiling, hot/cold placement, sparse operators, and backend-aware scheduling as first-class runtime concerns
+- direct integration points for ARM CPU, Rockchip RKLLM/RKNN, Qualcomm QNN, and future accelerator backends
+
+The repository MVP is implemented as a native C framework. Python is intentionally kept out of the runtime path.
 
 ## Goals
 
 - Run Qwen, Llama, Phi, Gemma, GPT-like open-weight models locally on edge devices.
-- Provide one offline framework across Rockchip, Qualcomm, and ARM CPU fallback targets.
+- Provide one offline framework across Rockchip, Qualcomm, Raspberry Pi, and ARM CPU fallback targets.
 - Expose an OpenAI-compatible local API for applications, IDE agents, local RAG, and tool calling.
 - Keep prompts, documents, embeddings, logs, and model execution fully local.
 - Use stage-aware scheduling for prefill, decode, verification, and agent workloads.
 - Support future PowerInfer-like sparse scheduling, neuron-cluster placement, and flash-aware weight management.
 
 ## Target Platforms
+
+### Raspberry Pi MVP Path
+
+Raspberry Pi is the recommended early substitute when Rockchip and Qualcomm boards are not available. It should be treated as a CPU fallback validation platform, not as an NPU validation platform.
+
+Recommended device:
+
+- Raspberry Pi 5 with 8 GB or 16 GB RAM.
+- 64-bit Raspberry Pi OS or another 64-bit Linux distribution.
+- GGUF models small enough for local CPU inference.
+
+The Raspberry Pi MVP validates:
+
+- local offline inference structure
+- `llama.cpp` / GGUF backend
+- OpenAI-compatible API
+- streaming responses
+- model manifest loading
+- capability profiling
+- benchmark harness
+- KV cache and context length limits
+
+It does not validate:
+
+- Rockchip RKLLM backend
+- Qualcomm QNN backend
+- true NPU prefill/decode split scheduling
+- vendor runtime operator compatibility
+- vendor-specific quantized artifact loading
 
 ### Rockchip RK3588 / RK3576
 
@@ -284,36 +342,112 @@ The initial framework does not depend on sparse models, but it leaves room for:
 
 ## MVP Scope
 
-The first implementation should focus on a practical, verifiable baseline.
+The first implementation should focus on a practical, verifiable baseline that can run on a development machine or Raspberry Pi before NPU hardware is available.
+
+The MVP is deliberately baseline-first. Its purpose is to prove runtime contracts, model metadata, profiling, scheduling traces, and benchmark methodology. It should not lock the project into Python or into `llama.cpp`. Any discussion of novelty should refer to the native runtime contract, capability profiler, scheduler, cache policy, flash-aware execution, sparse execution, and future NPU backends.
 
 Recommended MVP:
 
-- local OpenAI-compatible API
-- llama.cpp CPU backend
-- one NPU backend: RKLLM or QNN
+- local OpenAI-compatible `/v1/chat/completions` API shape
+- streaming and non-streaming chat responses
+- CPU baseline backend
 - model manifest format
 - device capability profiler
 - prefill/decode benchmark harness
-- KV cache limits
-- streaming response support
 - fully offline operation
+
+The MVP intentionally excludes:
+
+- production NPU execution
+- advanced heterogeneous scheduling
+- embeddings
+- tool calling
+- model artifact conversion
+- distributed serving
 
 Suggested first models:
 
+- Qwen2.5-0.5B-Instruct
 - Qwen2.5-1.5B-Instruct
 - Qwen3-0.6B
 - Qwen3-1.7B
 - Llama 3.2 1B
 - Llama 3.2 3B
 
+## Building the Native MVP
+
+The native runtime is the primary implementation direction. It follows the same broad engineering style as PowerInfer: a C core, CMake build, local CLI, and helper scripts only where needed.
+
+Windows users can follow the MinGW-w64 setup guide:
+
+```text
+docs/windows-mingw-setup.md
+```
+
+Configure and build:
+
+```bash
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+Inspect local device capabilities:
+
+```bash
+./build/edgexpu capabilities
+```
+
+On Windows with a multi-config generator:
+
+```bash
+.\build\Release\edgexpu.exe capabilities
+```
+
+Inspect a model manifest:
+
+```bash
+./build/edgexpu inspect-manifest examples/models/qwen2.5-0.5b/model.manifest.json
+```
+
+Run a benchmark through the selected CPU baseline backend:
+
+```bash
+./build/edgexpu benchmark examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
+```
+
+The initial native backend expects a PowerInfer/llama.cpp-style local binary such as `powerinfer` or `llama-cli` on `PATH`, or a command specified by the model manifest. Future versions should replace the shell-out baseline with direct native backend integration.
+
+Start the native OpenAI-compatible local API server:
+
+```bash
+./build/edgexpu serve examples/models/qwen2.5-0.5b/model.manifest.json 8000
+```
+
+Run a non-streaming chat request:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d @examples/requests/chat_completion.json
+```
+
+Run a benchmark:
+
+```bash
+./build/edgexpu benchmark examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
+```
+
+The MVP expects a `llama-cli`, `main`, or compatible llama.cpp binary on `PATH`. You can also set the command in the model manifest.
+
 ## Roadmap
 
 ### Phase 1: Baseline Runtime
 
-- Implement local API server.
-- Add llama.cpp backend.
-- Add model manifest parser.
-- Add simple benchmark command.
+- Create a C CMake native runtime skeleton.
+- Add a local CLI and optional local serving binary.
+- Add model manifest parser and backend contract.
+- Add CPU baseline execution path.
+- Add simple benchmark command and stage trace output.
 
 ### Phase 2: NPU Backend
 
@@ -387,5 +521,7 @@ Security requirements:
 EdgeXPU-LLM should be positioned as:
 
 > An offline, edge-native LLM inference runtime that unifies ARM CPU fallback, Rockchip NPU, and Qualcomm NPU backends through a common local API, model contract, capability profiler, and stage-aware scheduler.
+
+The `llama.cpp` backend is the first CPU fallback implementation and benchmark reference. It is not the framework's core differentiation. EdgeXPU-LLM's differentiation should be measured by backend portability, edge capability awareness, scheduling policy, cache and memory management, and the ability to route workloads across future NPU backends.
 
 The framework is feasible as a staged engineering project and has meaningful research potential in heterogeneous scheduling, flash-aware execution, sparse inference, and agent-oriented edge workloads.
