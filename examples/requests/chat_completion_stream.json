@@ -1,0 +1,16 @@
+{
+  "model": "qwen2.5-0.5b",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful local assistant running fully offline."
+    },
+    {
+      "role": "user",
+      "content": "Explain EdgeXPU-LLM streaming in one short sentence."
+    }
+  ],
+  "max_tokens": 32,
+  "temperature": 0.3,
+  "stream": true
+}

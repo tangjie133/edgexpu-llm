@@ -4,7 +4,9 @@
 #include <stddef.h>
 
 #include "edgexpu/backend.h"
+#include "edgexpu/executor.h"
 #include "edgexpu/manifest.h"
+#include "edgexpu/profiler.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,7 +14,10 @@ extern "C" {
 
 typedef struct edgexpu_runtime {
     edgexpu_model_manifest manifest;
+    edgexpu_device_profile device_profile;
+    edgexpu_executor executor;
     const edgexpu_backend *backend;
+    int has_device_profile;
     int loaded;
 } edgexpu_runtime;
 

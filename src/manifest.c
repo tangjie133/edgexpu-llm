@@ -1,5 +1,6 @@
 #include "edgexpu/manifest.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,6 +121,85 @@ static int extract_int(const char *json, const char *key, int *output) {
     return 1;
 }
 
+static int path_is_absolute(const char *path) {
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    if (path[0] == '/' || path[0] == '\\') {
+        return 1;
+    }
+
+    return isalpha((unsigned char)path[0]) &&
+        path[1] == ':' &&
+        (path[2] == '/' || path[2] == '\\');
+}
+
+static int manifest_directory(const char *path, char *output, size_t output_size) {
+    const char *slash;
+    const char *backslash;
+    const char *separator;
+    size_t length;
+
+    if (path == NULL || output == NULL || output_size == 0) {
+        return 0;
+    }
+
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    separator = slash;
+    if (backslash != NULL && (separator == NULL || backslash > separator)) {
+        separator = backslash;
+    }
+
+    if (separator == NULL) {
+        snprintf(output, output_size, ".");
+        return 1;
+    }
+
+    length = (size_t)(separator - path);
+    if (length == 0) {
+        length = 1;
+    }
+    if (length >= output_size) {
+        return 0;
+    }
+
+    memcpy(output, path, length);
+    output[length] = '\0';
+    return 1;
+}
+
+static int resolve_artifact_path(
+    const char *manifest_path,
+    char *artifact_path,
+    size_t artifact_path_size,
+    char *error,
+    size_t error_size
+) {
+    char directory[EDGEXPU_TEXT_LARGE];
+    char resolved[EDGEXPU_TEXT_LARGE];
+    int written;
+
+    if (artifact_path == NULL || artifact_path[0] == '\0' || path_is_absolute(artifact_path)) {
+        return 1;
+    }
+
+    if (!manifest_directory(manifest_path, directory, sizeof(directory))) {
+        set_error(error, error_size, "manifest 路径过长");
+        return 0;
+    }
+
+    written = snprintf(resolved, sizeof(resolved), "%s/%s", directory, artifact_path);
+    if (written < 0 || (size_t)written >= sizeof(resolved) || (size_t)written >= artifact_path_size) {
+        set_error(error, error_size, "artifact 路径过长");
+        return 0;
+    }
+
+    snprintf(artifact_path, artifact_path_size, "%s", resolved);
+    return 1;
+}
+
 int edgexpu_manifest_load(
     const char *path,
     edgexpu_model_manifest *manifest,
@@ -157,6 +237,11 @@ int edgexpu_manifest_load(
     extract_int(json, "kv_cache_required_mb", &manifest->kv_cache_required_mb);
     extract_string(json, "quantization", manifest->primary_artifact.quantization, sizeof(manifest->primary_artifact.quantization));
     extract_string(json, "command", manifest->primary_artifact.command, sizeof(manifest->primary_artifact.command));
+
+    if (!resolve_artifact_path(path, manifest->primary_artifact.path, sizeof(manifest->primary_artifact.path), error, error_size)) {
+        free(json);
+        return 0;
+    }
 
     free(json);
     return 1;

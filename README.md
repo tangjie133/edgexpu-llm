@@ -1,196 +1,195 @@
 # EdgeXPU-LLM
 
-EdgeXPU-LLM is an offline, edge-native LLM inference framework for ARM-based devices with heterogeneous accelerators. The current design focuses on Rockchip RK3588/RK3576 and Qualcomm Snapdragon/Dragonwing platforms, with ARM CPU fallback. STM32-class targets are intentionally excluded from this first framework draft.
+EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目标是在同一套本地运行时契约下，统一 ARM CPU fallback、Rockchip NPU、Qualcomm NPU，以及后续可能加入的 dNPU 辅助执行路径。
 
-The goal is not to copy cloud GPU inference stacks onto smaller hardware. The goal is to build a local runtime that understands edge constraints: NPU execution limits, CPU/NPU/GPU heterogeneity, unified memory bandwidth, flash storage, quantization formats, KV cache pressure, and privacy-sensitive workloads.
+这个项目不是把云端加速 serving 框架缩小后搬到小设备上。它要解决的是边缘设备自己的问题：NPU 图限制、CPU/NPU/dNPU 协同、统一内存压力、flash 带宽、量化格式、KV cache 增长、散热功耗限制，以及完全本地的隐私敏感工作负载。
 
-## Positioning Boundary
+第一阶段不覆盖 STM32 这类微控制器。当前目标设备是能运行 Linux 的边缘平台，例如 Raspberry Pi、RK3588/RK3576 开发板，以及 Qualcomm Snapdragon / Dragonwing 平台。
 
-EdgeXPU-LLM is not intended to be a thin wrapper around `llama.cpp`.
+## 项目边界
 
-In the MVP, `llama.cpp` is used only as the CPU baseline backend because it is practical on development machines and Raspberry Pi devices. The framework's intended innovation sits above and around individual inference engines:
+`llama.cpp` 只是临时方案。
 
-- a portable model artifact contract across GGUF, RKLLM, QNN, ONNX Runtime GenAI, and ExecuTorch
-- runtime capability profiling for edge devices
-- stage-aware scheduling for prefill, decode, verification, and agent workloads
-- KV cache, prompt cache, memory, and flash-aware execution policies
-- backend-independent telemetry and benchmark data for future NPU routing
+当前 MVP 使用 `llama.cpp` 或兼容工具作为 CPU bootstrap backend，目的是先验证 CLI、模型 manifest、benchmark 输出、本地 API 形态和基础 runtime 流程。在 native executor 成熟之前，它是一个方便的临时执行后端。
 
-If the project only exposes `llama.cpp` through an OpenAI-compatible API, it should be considered a baseline adapter rather than the core EdgeXPU-LLM framework.
+长期目标是用 EdgeXPU 自己的运行时替代 shell-out 推理，逐步实现：
 
-## Implementation Direction
+- 原生模型加载和 artifact 管理
+- CPU operator 执行和 fallback kernel
+- NPU/dNPU backend adapter
+- 异步 load、prefill、decode、KV cache、memory、flash、stream job
+- CPU、NPU、dNPU、memory、storage 之间的分阶段调度
+- backend 无关的 telemetry 和 benchmark trace
 
-The EdgeXPU-LLM runtime follows a PowerInfer-style native implementation model, not a Python application-server model.
+如果项目最终只是把 `llama.cpp` 包成 OpenAI-compatible API，那它只是一个 baseline adapter，不是 EdgeXPU-LLM 的核心。EdgeXPU-LLM 的核心价值应该来自 native runtime contract、async executor、设备能力 profiling、scheduler、cache policy、memory policy，以及未来的 accelerator routing。
 
-Reference implementation shape:
+## 当前状态
 
-- C core runtime built with CMake
-- local CLI and local serving binary
-- Python limited to helper scripts such as model conversion, profiling, or packaging
-- model formats derived from GGUF / PowerInfer GGUF concepts where appropriate
-- activation profiling, hot/cold placement, sparse operators, and backend-aware scheduling as first-class runtime concerns
-- direct integration points for ARM CPU, Rockchip RKLLM/RKNN, Qualcomm QNN, and future accelerator backends
+当前仓库已经有一套 native C MVP 骨架：
 
-The repository MVP is implemented as a native C framework. Python is intentionally kept out of the runtime path.
+- 基于 CMake 的 C runtime library 和 CLI
+- 模型 manifest loader
+- 设备能力 profiler
+- 简单 backend selector
+- Phase 2 async executor contract、单线程 job queue 和 benchmark trace 最小闭环
+- 通过 `llama`、`llama-cli`、`powerinfer` 或 `main` 调用的临时 CPU baseline backend
+- 带 stage trace 和 executor trace 的 benchmark 命令
+- 带 queue summary 和 scheduler policy 的 `trace` 调试命令
+- `executor-selftest` 队列自测命令
+- 本地 OpenAI-compatible `/v1/models` 和 `/v1/chat/completions` server
+- Qwen2.5 0.5B 示例 manifest 和 request body
+- MVP 验证脚本 `scripts/verify_mvp.sh`
 
-## Goals
+本地 benchmark 路径已经用 GGUF 模型和新版 `llama cli` 命令验证通过。当前 backend 会清理 CLI wrapper 输出，使 benchmark 和 API response 只包含模型生成文本。runtime 现在会通过单线程 runnable executor queue 执行 load、prefill、decode、KV cache、stream 和 telemetry job，benchmark 会输出带 queue summary、scheduler policy 和 `scheduler_reason` 的 `executor_trace`，用于验证 Phase 2 的最小闭环。
 
-- Run Qwen, Llama, Phi, Gemma, GPT-like open-weight models locally on edge devices.
-- Provide one offline framework across Rockchip, Qualcomm, Raspberry Pi, and ARM CPU fallback targets.
-- Expose an OpenAI-compatible local API for applications, IDE agents, local RAG, and tool calling.
-- Keep prompts, documents, embeddings, logs, and model execution fully local.
-- Use stage-aware scheduling for prefill, decode, verification, and agent workloads.
-- Support future PowerInfer-like sparse scheduling, neuron-cluster placement, and flash-aware weight management.
-
-## Target Platforms
-
-### Raspberry Pi MVP Path
-
-Raspberry Pi is the recommended early substitute when Rockchip and Qualcomm boards are not available. It should be treated as a CPU fallback validation platform, not as an NPU validation platform.
-
-Recommended device:
-
-- Raspberry Pi 5 with 8 GB or 16 GB RAM.
-- 64-bit Raspberry Pi OS or another 64-bit Linux distribution.
-- GGUF models small enough for local CPU inference.
-
-The Raspberry Pi MVP validates:
-
-- local offline inference structure
-- `llama.cpp` / GGUF backend
-- OpenAI-compatible API
-- streaming responses
-- model manifest loading
-- capability profiling
-- benchmark harness
-- KV cache and context length limits
-
-It does not validate:
-
-- Rockchip RKLLM backend
-- Qualcomm QNN backend
-- true NPU prefill/decode split scheduling
-- vendor runtime operator compatibility
-- vendor-specific quantized artifact loading
-
-### Rockchip RK3588 / RK3576
-
-Primary backend:
-
-- RKLLM
-- RKNN
-
-Expected model families:
-
-- Qwen2 / Qwen2.5 / Qwen3
-- TinyLlama
-- Phi
-- Gemma
-- selected VLMs where vision encoder and LLM runtime are supported
-
-Typical deployment path:
-
-1. Prepare a Hugging Face checkpoint.
-2. Convert and quantize with RKLLM-Toolkit.
-3. Generate `.rkllm` artifacts using W8A8 or W4A16.
-4. Run through RKLLM Runtime on the board.
-5. Expose the runtime through the EdgeXPU backend adapter.
-
-### Qualcomm Snapdragon / Dragonwing
-
-Primary backend candidates:
-
-- Qualcomm QNN
-- ExecuTorch Qualcomm backend
-- ONNX Runtime GenAI with QNN execution provider
-- vendor-specific Genie / AI Hub artifacts where appropriate
-
-Expected model families:
-
-- Qwen
-- Llama 3.2
-- Phi
-- Gemma
-- other open-weight decoder-only models that can be quantized and compiled for the target runtime
-
-### ARM CPU Fallback
-
-Primary backend:
-
-- llama.cpp
-
-Expected model format:
-
-- GGUF
-
-Purpose:
-
-- baseline inference
-- debugging
-- fallback when NPU operators are unsupported
-- devices without supported NPU runtime
-- benchmark reference against NPU paths
-
-## Architecture
+## 总体架构
 
 ```text
 Application Layer
-  IDE Agent / Local Chat / RAG / Tool Calling
+  Local Chat / IDE Agent / RAG / Tool Calling
         |
 Unified Local API
-  OpenAI-compatible API
+  OpenAI-compatible HTTP API
   generate / streamGenerate / embed / classify / toolCall
         |
 EdgeXPU Runtime Core
   Model Manager
   Capability Profiler
+  Async Executor
   Stage-Aware Scheduler
   KV Cache Manager
   Memory and Flash Manager
   Security Manager
         |
 Backend Adapter Layer
-  llama.cpp Backend
-  RKLLM Backend
-  QNN Backend
+  Native CPU Backend
+  Rockchip RKLLM/RKNN Backend
+  Qualcomm QNN Backend
   ONNX Runtime GenAI Backend
   ExecuTorch Backend
+  Temporary llama.cpp Bootstrap Backend
         |
 Hardware Layer
   ARM CPU
   Rockchip NPU
   Qualcomm Hexagon NPU
-  GPU
-  DRAM / unified memory / flash
+  dNPU
+  DRAM / Unified Memory / Flash
 ```
 
-## Core Components
+## 执行模型
 
-### Unified Local API
+运行时不应该把一次 LLM 推理当成一个黑盒 backend call。LLM 推理的不同阶段有不同的硬件特征。
 
-The framework exposes a consistent local API regardless of the underlying backend.
+Prefill：
 
-Candidate API surface:
+- 并行处理 prompt
+- 计算密集
+- 如果图和 shape 支持，通常更适合 NPU/dNPU
+
+Decode：
+
+- 每次生成一个 token
+- 经常受 memory bandwidth 限制
+- 因为动态 shape 和调度开销，不一定总是适合 NPU
+
+KV cache 和 memory：
+
+- 随 context length 和 session 数量增长
+- 需要 placement、eviction、reuse 和量化策略
+- 往往是边缘设备上最容易爆掉的资源
+
+Flash 和模型驻留：
+
+- 当权重不能轻松全部放进内存时很重要
+- 后续需要支持 prefetch、paging、hot/cold placement
+
+长期的 internal executor 应该把推理拆成类似这样的 job：
 
 ```text
-loadModel(model_id, options)
-unloadModel(model_id)
-generate(request)
-streamGenerate(request)
-embed(input)
-classify(input)
-toolCall(request)
-getCapabilities()
-benchmark(profile)
+loadModelArtifact
+preparePrompt
+prefill
+decodeStep
+updateKvCache
+prefetchWeights
+streamToken
+collectTelemetry
 ```
 
-The application should not need to know whether a model is running through RKLLM, QNN, ONNX Runtime, ExecuTorch, or llama.cpp.
+这样 scheduler 才能决定每个 job 应该跑在 CPU、NPU、dNPU，还是 memory/flash pipeline 上，而不是把整次请求固定给一个 backend。
 
-### Model Manager
+## 平台策略
 
-The model manager handles platform-specific artifacts under one logical model identity.
+### Raspberry Pi / ARM CPU Fallback
 
-Example layout:
+Raspberry Pi 是早期没有 Rockchip 或 Qualcomm 板子时的验证平台。它用于验证离线运行结构、GGUF 模型路径、本地 API、benchmark trace、manifest 加载和 CPU fallback 行为。
+
+它不验证生产级 NPU 调度，也不验证 vendor runtime 兼容性。
+
+### Rockchip RK3588 / RK3576
+
+未来主要 backend 候选：
+
+- RKLLM
+- RKNN
+
+预期部署路径：
+
+1. 准备 Hugging Face checkpoint。
+2. 使用 RKLLM-Toolkit 转换和量化。
+3. 生成 `.rkllm` 或 RKNN-compatible artifact。
+4. 通过 EdgeXPU backend adapter 加载 artifact。
+5. 向 scheduler 汇报 NPU 兼容性、内存占用、延迟和 fallback 原因。
+
+### Qualcomm Snapdragon / Dragonwing
+
+未来主要 backend 候选：
+
+- Qualcomm QNN
+- ExecuTorch Qualcomm backend
+- ONNX Runtime GenAI with QNN execution provider
+- 必要时接入 vendor-specific Genie 或 AI Hub artifact
+
+Qualcomm 路径重点验证 artifact 兼容性、operator 支持，以及 Hexagon NPU 上 prefill/decode 的真实性能表现。
+
+### 其他 NPU / dNPU 候选平台记录
+
+除 Rockchip 和 Qualcomm 之外，后续可以持续观察这些带 NPU、APU、BPU、KPU 或独立 AI accelerator 的平台：
+
+- MediaTek Dimensity / Kompanio：带 APU/NPU，手机、平板和 Chromebook 平台较多，但开放工具链和本地 LLM 部署路径需要进一步验证。
+- NXP i.MX 8M Plus / i.MX 9：带 NPU，偏工业边缘设备，适合小模型和稳定部署场景。
+- Amlogic A311D2 / Amlogic NPU 系列：部分开发板带 NPU，生态和 LLM 工具链成熟度需要评估。
+- Kendryte K230 / K510：RISC-V + KPU/NPU，适合小模型、视觉和轻量 AI 工作负载。
+- Sophgo BM1684X / CV 系列：偏边缘盒子、算力卡和国产化部署路线，主要工具链是 Sophon SDK。
+- Axera AX 系列：国内边缘 AI SoC，偏视觉、多模态和端侧推理。
+- Horizon Robotics Journey / Sunrise：车载和机器人方向，使用 BPU 架构。
+- Intel Core Ultra NPU：x86 边缘设备上的 NPU 路线，可以通过 OpenVINO 方向评估。
+- Google Coral Edge TPU / Hailo-8：更适合轻量模型、embedding、vision encoder 或辅助任务，不应作为主 LLM backend 的第一优先级。
+
+初步优先级：
+
+1. Rockchip RKLLM/RKNN：优先验证，适合当前项目的第一条 NPU 路线。
+2. Qualcomm QNN：第二优先级，适合 Snapdragon / Dragonwing 设备和未来移动端路线。
+3. NXP / MediaTek / Intel OpenVINO：作为中期候选，重点看工具链开放程度和 transformer operator 支持。
+4. Sophgo / Axera / Horizon：作为国产边缘 AI SoC 路线储备，适合后续按硬件可得性推进。
+5. Hailo / Coral：主要作为轻量 AI 或视觉/embedding 辅助 accelerator，不作为主 LLM backend。
+
+选型时不能只看是否“带 NPU”。EdgeXPU-LLM 更关心：
+
+- 是否支持 transformer 关键 operator
+- 是否支持适合 LLM 的 quantization 格式
+- prefill 和 decode 是否都能有效执行
+- 是否支持 dynamic shape 或可接受的固定 shape 编排
+- KV cache 能否被 runtime 管理或绕过
+- vendor runtime 是否开放、稳定、可离线部署
+- telemetry 是否足够支撑 scheduler 做决策
+
+## 模型契约
+
+每个模型应该由一个逻辑 manifest 描述，并可以关联多个平台 artifact。
+
+示例目录：
 
 ```text
 models/qwen2.5-1.5b/
@@ -200,230 +199,107 @@ models/qwen2.5-1.5b/
   qualcomm/qwen2.5-1.5b-qnn/
 ```
 
-The model manifest should describe:
+manifest 应该描述：
 
-- model family
-- parameter size
-- context length
-- quantization format
-- backend compatibility
-- memory requirement
-- KV cache requirement
+- 模型身份、family、参数规模、context length
 - supported tasks
-- expected throughput range
+- artifact format、quantization、backend、path
+- memory 和 KV cache 需求
 - fallback policy
+- 预期吞吐和兼容性说明
 
-### Capability Profiler
+应用层不应该关心当前选中的 artifact 跑在 CPU、Rockchip NPU、Qualcomm NPU、dNPU，还是临时 bootstrap backend。
 
-The capability profiler detects the actual device environment at startup.
+## MVP 范围
 
-It should capture:
+MVP 要保持小而可验证。
 
-- CPU architecture and core count
-- SIMD support
-- NPU type and driver/runtime version
-- available DRAM
-- flash or storage bandwidth
-- supported quantization formats
-- supported operators
-- thermal and power mode
-- installed backend runtimes
+包含：
 
-The profiler output drives backend selection and scheduling policy.
+- native C runtime skeleton
+- 本地 CLI
+- OpenAI-compatible `/v1/models` 和 `/v1/chat/completions`
+- streaming 和 non-streaming response 形态
+- 模型 manifest 加载
+- 设备能力 profiling
+- 临时 CPU bootstrap backend
+- 带近似 prefill/decode trace 的 benchmark 命令
+- 完全离线运行
 
-### Stage-Aware Scheduler
+暂不包含：
 
-LLM inference has different stages with different hardware behavior.
-
-Prefill:
-
-- processes the prompt in parallel
-- compute intensive
-- usually benefits from NPU/GPU if the backend supports the graph
-
-Decode:
-
-- generates one token at a time
-- memory bandwidth sensitive
-- may not always benefit from NPU due to dynamic shapes and scheduling overhead
-
-Verification or speculative decoding:
-
-- can use a small draft model and a larger verifier
-- useful for latency-sensitive local agents
-
-The scheduler should make decisions by stage instead of using a fixed backend for the whole request.
-
-### KV Cache Manager
-
-KV cache is a major memory consumer on edge devices.
-
-Required capabilities:
-
-- context length enforcement
-- prefix cache
-- prompt cache
-- sliding window
-- quantized KV cache
-- cache eviction
-- per-session memory limits
-- RAG prefix reuse
-
-### Memory and Flash Manager
-
-Edge devices may be limited by DRAM and storage bandwidth.
-
-The memory manager should support:
-
-- model residency budget
-- weight paging
-- flash-aware prefetch
-- contiguous block layout
-- hot/cold weight partitioning
-- I/O and compute overlap
-
-This component prepares the framework for future PowerInfer-like and LLM-in-a-Flash-style optimizations.
-
-### Backend Adapters
-
-Backend adapters isolate platform-specific runtimes.
-
-Rockchip adapter:
-
-- loads `.rkllm` artifacts
-- calls RKLLM Runtime
-- reports NPU utilization and memory usage
-- streams generated tokens
-
-Qualcomm adapter:
-
-- loads QNN / ExecuTorch / ONNX Runtime GenAI artifacts
-- handles QNN runtime initialization
-- reports accelerator availability and fallback
-
-llama.cpp adapter:
-
-- loads GGUF models
-- provides CPU baseline
-- supports fallback inference
-
-## Innovation Points
-
-### Edge-Native Runtime
-
-The framework is designed around edge hardware constraints rather than cloud GPU assumptions.
-
-### Stage-Aware Heterogeneous Scheduling
-
-The runtime treats prefill and decode differently, selecting CPU, NPU, GPU, or hybrid execution based on measured behavior.
-
-### Portable Backend Contract
-
-The framework provides one API and model contract while allowing each platform to use its own optimized runtime.
-
-### Agent-Aware Execution
-
-IDE and agent workloads have foreground and background tasks. The scheduler can prioritize latency-sensitive requests while delaying background analysis or indexing.
-
-### Flash-Aware Model Execution
-
-The design treats flash storage as part of the inference system, enabling future support for models that exceed available memory.
-
-### PowerInfer-Like Sparse Extension
-
-The initial framework does not depend on sparse models, but it leaves room for:
-
-- activation profiling
-- hot/cold neuron placement
-- neuron-cluster scheduling
-- sparse FFN
-- sparse attention
-- segmented cache
-
-## MVP Scope
-
-The first implementation should focus on a practical, verifiable baseline that can run on a development machine or Raspberry Pi before NPU hardware is available.
-
-The MVP is deliberately baseline-first. Its purpose is to prove runtime contracts, model metadata, profiling, scheduling traces, and benchmark methodology. It should not lock the project into Python or into `llama.cpp`. Any discussion of novelty should refer to the native runtime contract, capability profiler, scheduler, cache policy, flash-aware execution, sparse execution, and future NPU backends.
-
-Recommended MVP:
-
-- local OpenAI-compatible `/v1/chat/completions` API shape
-- streaming and non-streaming chat responses
-- CPU baseline backend
-- model manifest format
-- device capability profiler
-- prefill/decode benchmark harness
-- fully offline operation
-
-The MVP intentionally excludes:
-
-- production NPU execution
-- advanced heterogeneous scheduling
+- 生产级 NPU 执行
+- 完整 native transformer 实现
+- 高级异构调度
 - embeddings
 - tool calling
-- model artifact conversion
+- 模型转换 pipeline
 - distributed serving
 
-Suggested first models:
+## 构建和运行
 
-- Qwen2.5-0.5B-Instruct
-- Qwen2.5-1.5B-Instruct
-- Qwen3-0.6B
-- Qwen3-1.7B
-- Llama 3.2 1B
-- Llama 3.2 3B
-
-## Building the Native MVP
-
-The native runtime is the primary implementation direction. It follows the same broad engineering style as PowerInfer: a C core, CMake build, local CLI, and helper scripts only where needed.
-
-Windows users can follow the MinGW-w64 setup guide:
-
-```text
-docs/windows-mingw-setup.md
-```
-
-Configure and build:
+配置并构建：
 
 ```bash
 cmake -S . -B build
 cmake --build build --config Release
 ```
 
-Inspect local device capabilities:
+运行 MVP 验证脚本：
+
+```bash
+bash scripts/verify_mvp.sh
+```
+
+Windows 用户可以参考：
+
+```text
+docs/windows-mingw-setup.md
+```
+
+查看本机能力：
 
 ```bash
 ./build/edgexpu capabilities
 ```
 
-On Windows with a multi-config generator:
-
-```bash
-.\build\Release\edgexpu.exe capabilities
-```
-
-Inspect a model manifest:
+查看模型 manifest：
 
 ```bash
 ./build/edgexpu inspect-manifest examples/models/qwen2.5-0.5b/model.manifest.json
 ```
 
-Run a benchmark through the selected CPU baseline backend:
+运行 benchmark：
 
 ```bash
 ./build/edgexpu benchmark examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
 ```
 
-The initial native backend expects a PowerInfer/llama.cpp-style local binary such as `powerinfer` or `llama-cli` on `PATH`, or a command specified by the model manifest. Future versions should replace the shell-out baseline with direct native backend integration.
+查看 executor trace：
 
-Start the native OpenAI-compatible local API server:
+```bash
+./build/edgexpu trace examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
+```
+
+运行 executor 自测：
+
+```bash
+./build/edgexpu executor-selftest
+```
+
+启动本地 API server：
 
 ```bash
 ./build/edgexpu serve examples/models/qwen2.5-0.5b/model.manifest.json 8000
 ```
 
-Run a non-streaming chat request:
+列出模型：
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+运行 chat completion：
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -431,97 +307,51 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d @examples/requests/chat_completion.json
 ```
 
-Run a benchmark:
+临时 CPU bootstrap backend 需要 `PATH` 中存在以下命令之一，也可以在 manifest 里指定：
 
-```bash
-./build/edgexpu benchmark examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
+- `llama`
+- `llama-cli`
+- `powerinfer`
+- `main`
+
+如果使用新版 llama.cpp distribution，manifest 中设置：
+
+```json
+"command": "llama"
 ```
 
-The MVP expects a `llama-cli`, `main`, or compatible llama.cpp binary on `PATH`. You can also set the command in the model manifest.
+runtime 会在内部调用 `llama cli`。
 
-## Roadmap
+## 计划与设计记录
 
-### Phase 1: Baseline Runtime
+详细路线图、设计决策、阶段状态、当前限制和近期执行计划统一记录在：
 
-- Create a C CMake native runtime skeleton.
-- Add a local CLI and optional local serving binary.
-- Add model manifest parser and backend contract.
-- Add CPU baseline execution path.
-- Add simple benchmark command and stage trace output.
+```text
+README.plan.zh.md
+```
 
-### Phase 2: NPU Backend
+主 `README.md` 只保留项目定位、架构、平台策略和使用方式，避免后续开发记录混在主介绍文档里。
 
-- Add RKLLM or QNN adapter.
-- Add runtime capability detection.
-- Compare CPU and NPU prefill/decode behavior.
+## 隐私和安全
 
-### Phase 3: Scheduler
+EdgeXPU-LLM 面向私有离线部署。
 
-- Implement stage-aware backend selection.
-- Add prompt cache and KV cache policy.
-- Add latency and memory telemetry.
+基本要求：
 
-### Phase 4: Edge Optimization
+- 默认不使用云端推理
+- 默认不上传 telemetry
+- 模型本地存储
+- prompt、document、embedding 和 log 本地保存
+- 任何网络访问都需要用户显式控制
+- 后续支持 signed manifest 和 encrypted model artifact
 
-- Add flash-aware weight management.
-- Add speculative decoding support.
-- Add background and foreground agent priorities.
+## 研究参考
 
-### Phase 5: Research Extensions
-
-- Add activation profiling.
-- Add hot/cold weight placement.
-- Add neuron-cluster scheduling.
-- Explore sparse and MoE models.
-
-## Privacy and Security
-
-The framework is designed for offline private deployment.
-
-Security requirements:
-
-- no cloud inference by default
-- no telemetry by default
-- local model storage
-- local vector database
-- local logs
-- encrypted model artifacts where possible
-- signed model manifests
-- secure runtime configuration
-- explicit user control for any network access
-
-## Research References
-
-- PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU  
-  https://arxiv.org/html/2312.12456
-
-- PowerInfer-2: Fast Large Language Model Inference on a Smartphone  
-  https://arxiv.org/html/2406.06282
-
-- Fast On-device LLM Inference with NPUs  
-  https://arxiv.org/html/2407.05858v2
-
-- ShadowNPU: System and Algorithm Co-design for NPU-Centric On-Device LLM Inference  
-  https://arxiv.org/html/2508.16703
-
-- Agent.xpu: Efficient Scheduling of Agentic LLM Workloads on Heterogeneous SoC  
-  https://arxiv.org/html/2506.24045v2
-
-- LLM in a Flash: Efficient Large Language Model Inference with Limited Memory  
-  https://machinelearning.apple.com/research/efficient-large-language
-
-- RKNN-LLM / RKLLM  
-  https://github.com/airockchip/rknn-llm
-
-- ONNX Runtime GenAI  
-  https://github.com/microsoft/onnxruntime-genai
-
-## Current Positioning
-
-EdgeXPU-LLM should be positioned as:
-
-> An offline, edge-native LLM inference runtime that unifies ARM CPU fallback, Rockchip NPU, and Qualcomm NPU backends through a common local API, model contract, capability profiler, and stage-aware scheduler.
-
-The `llama.cpp` backend is the first CPU fallback implementation and benchmark reference. It is not the framework's core differentiation. EdgeXPU-LLM's differentiation should be measured by backend portability, edge capability awareness, scheduling policy, cache and memory management, and the ability to route workloads across future NPU backends.
-
-The framework is feasible as a staged engineering project and has meaningful research potential in heterogeneous scheduling, flash-aware execution, sparse inference, and agent-oriented edge workloads.
+- [PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU](https://arxiv.org/html/2312.12456)
+- [PowerInfer-2: Fast Large Language Model Inference on a Smartphone](https://arxiv.org/html/2406.06282)
+- [Fast On-device LLM Inference with NPUs](https://arxiv.org/html/2407.05858v2)
+- [ShadowNPU: System and Algorithm Co-design for NPU-Centric On-Device LLM Inference](https://arxiv.org/html/2508.16703)
+- [Agent.xpu: Efficient Scheduling of Agentic LLM Workloads on Heterogeneous SoC](https://arxiv.org/html/2506.24045v2)
+- [LLM in a Flash: Efficient Large Language Model Inference with Limited Memory](https://machinelearning.apple.com/research/efficient-large-language)
+- [RKNN-LLM / RKLLM](https://github.com/airockchip/rknn-llm)
+- [ONNX Runtime GenAI](https://github.com/microsoft/onnxruntime-genai)

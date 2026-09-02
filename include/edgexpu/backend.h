@@ -36,7 +36,10 @@ typedef struct edgexpu_backend {
         size_t error_size
     );
 
-    /* 执行一次生成。后续 NPU backend 也应实现同一契约。 */
+    /* 执行一次生成。
+     * 当前同步接口是 MVP 门面；后续内部应拆成异步 load/prefill/decode/KV/stream jobs，
+     * 由调度器在 CPU、NPU、GPU 和 flash/memory 管线之间编排。
+     */
     int (*generate)(
         const edgexpu_generation_request *request,
         edgexpu_generation_result *result,
@@ -45,7 +48,7 @@ typedef struct edgexpu_backend {
     );
 } edgexpu_backend;
 
-/* 返回 CPU baseline backend。它对应 PowerInfer/llama.cpp 风格的本地二进制调用。 */
+/* 返回临时 CPU bootstrap backend。它对应 PowerInfer/llama.cpp 风格的本地二进制调用。 */
 const edgexpu_backend *edgexpu_backend_cpu_baseline(void);
 
 #ifdef __cplusplus
