@@ -30,6 +30,14 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 
 ## 已完成记录
 
+### 2026-09-02：architecture adapter 与可替换模型包
+
+- native forward 不再写死 Qwen2：`src/arch.c` 按 GGUF `general.architecture` 选择 RoPE / QKV bias / FFN / tokenizer。
+- 当前 adapter：`qwen2`（Neox + bias）、`llama`/`mistral`（NORM，无 bias）。
+- 模型包 `chat_template` 用 `{{prompt}}`；只在 generate 路径套用。runtime 不写死 `<|im_start|>`。
+- GPT-2 bytes 编解码与 `<...>` 特殊 token 整段 lookup。参考包 generate 已能输出连贯英文。
+- 第二个包 `examples/models/smollm2-135m/`：同一套 CLI，只换 manifest；adapter=llama。
+
 ### 2026-09-02：项目定位重梳理
 
 - EdgeXPU-LLM 定位为边缘设备离线 LLM runtime，不是普通 llama.cpp wrapper。

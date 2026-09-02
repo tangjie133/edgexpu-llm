@@ -312,7 +312,7 @@ docs/windows-mingw-setup.md
 ./build/edgexpu inspect-gguf examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ./build/edgexpu tokenize examples/models/qwen2.5-0.5b/model.manifest.json "Hello EdgeXPU"
 ./build/edgexpu native-selftest examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf
-./build/edgexpu inspect-gguf examples/models/smollm2-135m/smollm2-135m-instruct-q4_k_m.gguf
+./build/edgexpu inspect-gguf examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf
 ./build/edgexpu tokenize examples/models/smollm2-135m/model.manifest.json "Hello EdgeXPU"
 ```
 

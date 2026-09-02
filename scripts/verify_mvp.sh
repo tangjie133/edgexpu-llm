@@ -64,6 +64,8 @@ require_file "${MANIFEST}"
 require_file "${GGUF}"
 require_file "${CHAT_REQUEST}"
 require_file "${STREAM_REQUEST}"
+require_file "${ROOT_DIR}/examples/models/smollm2-135m/model.manifest.json"
+require_file "${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 
 echo "[2/14] building"
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
@@ -191,7 +193,7 @@ require_contains "${NOT_FOUND_OUTPUT}" "edgexpu_error" "unknown route"
 
 echo "[14/14] checking second model pack swap"
 SECOND_MANIFEST="${ROOT_DIR}/examples/models/smollm2-135m/model.manifest.json"
-SECOND_GGUF="${ROOT_DIR}/examples/models/smollm2-135m/smollm2-135m-instruct-q4_k_m.gguf"
+SECOND_GGUF="${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 require_file "${SECOND_MANIFEST}"
 require_file "${SECOND_GGUF}"
 SECOND_MANIFEST_OUTPUT="$("${BIN}" inspect-manifest "${SECOND_MANIFEST}")"

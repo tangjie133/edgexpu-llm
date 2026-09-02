@@ -11,7 +11,7 @@
   "artifacts": [
     {
       "backend": "cpu.baseline",
-      "path": "smollm2-135m-instruct-q4_k_m.gguf",
+      "path": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
       "format": "gguf",
       "quantization": "Q4_K_M",
       "command": "llama",
