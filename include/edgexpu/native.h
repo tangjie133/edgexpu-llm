@@ -49,6 +49,26 @@ typedef struct edgexpu_native_layer {
     int n_heads;
     int n_kv_heads;
     int head_dim;
+    edgexpu_layer_kind kind;
+    float *attn_q_norm;
+    float *attn_k_norm;
+    edgexpu_qweight wqkv;
+    edgexpu_qweight wattn_gate;
+    edgexpu_qweight wssm_out;
+    edgexpu_qweight wssm_alpha;
+    edgexpu_qweight wssm_beta;
+    float *ssm_conv;
+    float *ssm_dt;
+    float *ssm_a;
+    float *ssm_norm;
+    float *conv_state;
+    float *ssm_state;
+    int qkv_dim;
+    int ssm_dk;
+    int ssm_dv;
+    int ssm_n_k;
+    int ssm_n_v;
+    int ssm_conv_k;
     int ready;
 } edgexpu_native_layer;
 

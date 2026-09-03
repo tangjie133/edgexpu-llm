@@ -7,7 +7,7 @@ EdgeXPU-LLM 是边缘离线 LLM runtime。开源后请按层改代码，不要�
 | 你想做的事 | 改这些 | 不要改 |
 | --- | --- | --- |
 | 换一个已支持架构的 GGUF | `examples/models/<pack>/`（manifest、GGUF、`verify.lock`、chat_template） | runtime / native forward |
-| 新 GGUF `general.architecture` | 复制 `src/arch/_template.c` → `src/arch/<id>.c`，实现 `native_forward=1` 的层，在 `register.c` 登记 | 改走 llama `cpu.baseline` 当产品路径 |
+| 新 GGUF `general.architecture` | 复制 `src/arch/_template.c` → `src/arch/<id>.c`，`configure` 填 RoPE / tensor 名，`layer_kind` 标已有 kernel；在 `register.c` 登记 | 在 `src/native.c` 写死该模型的 `blk.%d.*` 或改走 llama |
 | hybrid / SSM / MoE / fused QKV | 同一套 plugin + kernel；未实现前 `generate` 报错 | 把「暂不支持」写成 llama 后备 |
 | 新执行后端（RKLLM / QNN） | 新文件实现 `edgexpu_backend` 分步 vtable（`load` / `prefill` / `decode_step`），在 `edgexpu_scheduler_select_backend` 里按 manifest `backend` 选择 | 只在 scheduler 里加字符串、没有 .c |
 | tokenizer 不是 GPT-2 BPE | 新 tokenizer 实现 + plugin `configure` 里拒绝或接线 | 假设所有模型都是 gpt2 |
@@ -24,9 +24,11 @@ EdgeXPU-LLM 是边缘离线 LLM runtime。开源后请按层改代码，不要�
 
 产品执行**一律** `cpu.native`。llama.cpp 只给 `compare` / `align_llama.sh` 对照，不是某一类模型的正式后端。
 
-`NATIVE=1`：CI 锁 dump-logits（native 已能跑）。`NATIVE=0`：架构插件还未完成前向，CI 只锁 tokenize；`generate` 应失败并指出缺 adapter，**不得**改走 llama。
+`NATIVE=1`：CI 锁 dump-logits（native 已能跑）。`NATIVE=0`：架构插件还未完成前向，CI 锁 tokenize，并且 `generate` 必须因缺 adapter 失败。
 
-Qwen3.5 目前是 `NATIVE=0`：能分词，还不能自研 SSM 前向。缺口是实现 `src/arch/qwen35` 的层，而不是声明 `cpu.baseline`。
+已有 kernel：`ATTN_SWIGLU`、`GATED_DELTA`、`ATTN_QK_NORM`。新 architecture 只登记 plugin 并填 tensor 名；不要在 `native.c` 加 `load_layer_<model>`。
+
+Qwen3.5 包是 `NATIVE=1` 的 hybrid 示例：plugin 选层类型，forward 走上面三套算子。
 
 ## 架构插件
 
@@ -38,7 +40,7 @@ Qwen3.5 目前是 `NATIVE=0`：能分词，还不能自研 SSM 前向。缺口�
 
 ## Backend 插件
 
-`include/edgexpu/backend.h`：产品 backend 是 `cpu.native` 的分步接口。llama bootstrap 只给 `edgexpu compare` 用；compare 在 native load 失败时仍跑 llama 腿，`generate`/`serve` 不会。
+`include/edgexpu/backend.h`：产品 backend 是 `cpu.native` 的分步接口。`generate` / `serve` / `verify_mvp.sh` 不依赖 llama。
 
 ## 资源调度
 
@@ -54,4 +56,4 @@ bash scripts/verify_mvp.sh
 
 树莓派 clone 后没有权重。把 `SmolLM2-135M-Instruct-Q4_K_M.gguf` 放到 `examples/models/smollm2-135m/` 再跑 `verify_mvp.sh` 或 `verify_arm.sh`。缺这个文件时脚本红，不是 runtime 回退到 llama。
 
-不要把 llama.cpp 写进默认 CI。对照数值用 `scripts/align_llama.sh`。
+`verify_mvp.sh` 只验 `cpu.native`。对照脚本 `scripts/align_llama.sh` 是可选的，不进这条入口。

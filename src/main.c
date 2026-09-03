@@ -850,7 +850,26 @@ static int command_inspect_gguf(const char *gguf_path) {
     printf("feed_forward_length=%u\n", info.feed_forward_length);
     printf("head_count=%u\n", info.head_count);
     printf("head_count_kv=%u\n", info.head_count_kv);
-    printf("head_dim=%d\n", edgexpu_gguf_head_dim(&info));
+    printf("head_dim=%d attn_head_dim=%d\n", edgexpu_gguf_head_dim(&info), edgexpu_gguf_attn_head_dim(&info));
+    printf("attention_key_length=%u attention_value_length=%u\n", info.attention_key_length, info.attention_value_length);
+    if (info.full_attention_interval > 0 || info.ssm_inner_size > 0) {
+        printf(
+            "rope_dimension_count=%u rope_sections=%d,%d,%d,%d\n",
+            info.rope_dimension_count,
+            info.rope_sections[0],
+            info.rope_sections[1],
+            info.rope_sections[2],
+            info.rope_sections[3]
+        );
+        printf(
+            "ssm_conv_kernel=%u ssm_inner_size=%u ssm_state_size=%u ssm_time_step_rank=%u ssm_group_count=%u\n",
+            info.ssm_conv_kernel,
+            info.ssm_inner_size,
+            info.ssm_state_size,
+            info.ssm_time_step_rank,
+            info.ssm_group_count
+        );
+    }
     printf("tensor_count=%llu\n", (unsigned long long)info.tensor_count);
     printf("tokenizer_model=%s\n", info.tokenizer_model);
     printf("tokenizer_pre=%s\n", info.tokenizer_pre);
@@ -891,6 +910,23 @@ static int command_inspect_gguf(const char *gguf_path) {
            edgexpu_ffn_type_name(adapter.ffn),
            edgexpu_tokenizer_kind_name(adapter.tokenizer),
            adapter.native_forward);
+    if (adapter.plugin != NULL && adapter.plugin->layer_kind != NULL && info.block_count > 0) {
+        uint32_t li;
+        printf("hybrid_layers=");
+        for (li = 0; li < info.block_count; li++) {
+            edgexpu_layer_kind kind = edgexpu_arch_layer_kind(&adapter, &info, (int)li);
+            const char *label = "attn";
+            if (kind == EDGEXPU_LAYER_GATED_DELTA) {
+                label = "gated_delta";
+            } else if (kind == EDGEXPU_LAYER_ATTN_QK_NORM) {
+                label = "attn_qk_norm";
+            } else if (kind == EDGEXPU_LAYER_UNSUPPORTED) {
+                label = "unsupported";
+            }
+            printf("%s%s", li == 0 ? "" : ",", label);
+        }
+        printf("\n");
+    }
     edgexpu_gguf_info_free(&info);
     edgexpu_tokenizer_free(&tokenizer);
     return 0;

@@ -1,5 +1,6 @@
 #include "edgexpu/gguf.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,6 +84,48 @@ static int read_string_into(FILE *file, char *output, size_t output_size) {
 }
 
 static int skip_value(FILE *file, uint32_t type);
+
+static void apply_gguf_u32_key(edgexpu_gguf_info *info, const char *key, uint32_t value) {
+    if (strstr(key, "block_count") != NULL) {
+        info->block_count = value;
+    } else if (strstr(key, "context_length") != NULL) {
+        info->context_length = value;
+    } else if (strstr(key, "embedding_length") != NULL) {
+        info->embedding_length = value;
+    } else if (strstr(key, "feed_forward_length") != NULL) {
+        info->feed_forward_length = value;
+    } else if (strstr(key, "attention.head_count_kv") != NULL) {
+        info->head_count_kv = value;
+    } else if (strstr(key, "attention.head_count") != NULL) {
+        info->head_count = value;
+    } else if (strstr(key, "attention.key_length") != NULL) {
+        info->attention_key_length = value;
+    } else if (strstr(key, "attention.value_length") != NULL) {
+        info->attention_value_length = value;
+    } else if (strstr(key, "full_attention_interval") != NULL) {
+        info->full_attention_interval = value;
+    } else if (strstr(key, "ssm.conv_kernel") != NULL) {
+        info->ssm_conv_kernel = value;
+    } else if (strstr(key, "ssm.inner_size") != NULL) {
+        info->ssm_inner_size = value;
+    } else if (strstr(key, "ssm.state_size") != NULL) {
+        info->ssm_state_size = value;
+    } else if (strstr(key, "ssm.time_step_rank") != NULL) {
+        info->ssm_time_step_rank = value;
+    } else if (strstr(key, "ssm.group_count") != NULL) {
+        info->ssm_group_count = value;
+    } else if (strstr(key, "rope.dimension_count") != NULL) {
+        info->rope_dimension_count = value;
+    } else if (strcmp(key, "general.file_type") == 0) {
+        info->file_type = value;
+    } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
+        info->eos_token_id = value;
+    } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
+        info->bos_token_id = value;
+    } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
+        info->pad_token_id = value;
+    }
+}
 
 static int skip_array(FILE *file) {
     uint32_t element_type = 0;
@@ -208,6 +251,29 @@ int edgexpu_gguf_head_dim(const edgexpu_gguf_info *info) {
     return (int)(info->embedding_length / info->head_count);
 }
 
+int edgexpu_gguf_attn_head_dim(const edgexpu_gguf_info *info) {
+    uint32_t index;
+    if (info == NULL) {
+        return 0;
+    }
+    if (info->attention_key_length > 0) {
+        return (int)info->attention_key_length;
+    }
+    if (info->attention_value_length > 0) {
+        return (int)info->attention_value_length;
+    }
+    for (index = 0; index < info->n_tensors; index++) {
+        const edgexpu_gguf_tensor *tensor = &info->tensors[index];
+        if (strstr(tensor->name, ".attn_k.weight") == NULL || tensor->n_dims < 2) {
+            continue;
+        }
+        if (info->head_count_kv > 0 && tensor->dims[1] % info->head_count_kv == 0) {
+            return (int)(tensor->dims[1] / info->head_count_kv);
+        }
+    }
+    return edgexpu_gguf_head_dim(info);
+}
+
 const edgexpu_gguf_tensor *edgexpu_gguf_find_tensor(
     const edgexpu_gguf_info *info,
     const char *name
@@ -329,26 +395,15 @@ int edgexpu_gguf_load(
                 fclose(file);
                 return 0;
             }
-            if (strstr(key, "block_count") != NULL) {
-                info->block_count = value;
-            } else if (strstr(key, "context_length") != NULL) {
-                info->context_length = value;
-            } else if (strstr(key, "embedding_length") != NULL) {
-                info->embedding_length = value;
-            } else if (strstr(key, "feed_forward_length") != NULL) {
-                info->feed_forward_length = value;
-            } else if (strstr(key, "attention.head_count_kv") != NULL) {
-                info->head_count_kv = value;
-            } else if (strstr(key, "attention.head_count") != NULL) {
-                info->head_count = value;
-            } else if (strcmp(key, "general.file_type") == 0) {
-                info->file_type = value;
-            } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
-                info->eos_token_id = value;
-            } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
-                info->bos_token_id = value;
-            } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
-                info->pad_token_id = value;
+            apply_gguf_u32_key(info, key, value);
+        } else if (type == GGUF_U64 || type == GGUF_I64) {
+            uint64_t value = 0;
+            if (!read_u64(file, &value)) {
+                fclose(file);
+                return 0;
+            }
+            if (value <= UINT32_MAX) {
+                apply_gguf_u32_key(info, key, (uint32_t)value);
             }
         } else if (type == GGUF_BOOL) {
             uint8_t value = 0;
@@ -369,6 +424,50 @@ int edgexpu_gguf_load(
                 info->rms_eps = value;
             } else if (strstr(key, "rope.freq_base") != NULL) {
                 info->rope_freq_base = value;
+            }
+        } else if (type == GGUF_ARRAY) {
+            uint32_t element_type = 0;
+            uint64_t count = 0;
+            uint64_t index;
+            if (!read_u32(file, &element_type) || !read_u64(file, &count)) {
+                fclose(file);
+                return 0;
+            }
+            if (strstr(key, "rope.dimension_sections") != NULL &&
+                (element_type == GGUF_I32 || element_type == GGUF_U32 ||
+                 element_type == GGUF_I64 || element_type == GGUF_U64)) {
+                for (index = 0; index < count; index++) {
+                    int32_t value = 0;
+                    if (element_type == GGUF_I64 || element_type == GGUF_U64) {
+                        int64_t wide = 0;
+                        if (!read_exact(file, &wide, sizeof(wide))) {
+                            fclose(file);
+                            return 0;
+                        }
+                        value = (int32_t)wide;
+                    } else if (!read_exact(file, &value, sizeof(value))) {
+                        fclose(file);
+                        return 0;
+                    }
+                    if (index < 4) {
+                        info->rope_sections[index] = value;
+                    }
+                }
+            } else if (element_type == GGUF_STRING) {
+                for (index = 0; index < count; index++) {
+                    uint64_t length = 0;
+                    if (!read_u64(file, &length) || !skip_bytes(file, length)) {
+                        fclose(file);
+                        return 0;
+                    }
+                }
+            } else if (element_type > GGUF_F64 || k_gguf_scalar_size[element_type] == 0) {
+                fclose(file);
+                set_error(error, error_size, "GGUF metadata 跳过失败");
+                return 0;
+            } else if (!skip_bytes(file, count * k_gguf_scalar_size[element_type])) {
+                fclose(file);
+                return 0;
             }
         } else if (!skip_value(file, type)) {
             fclose(file);

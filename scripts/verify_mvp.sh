@@ -2,7 +2,7 @@
 # One CI entry: native CPU fallback (no llama.cpp shell-out on the product path).
 # Greedy locks live next to each model pack: examples/models/<pack>/verify.lock
 # Shared prompt/n: scripts/verify.locks
-# Optional llama.cpp: scripts/align_llama.sh  or  edgexpu compare
+# Optional llama.cpp: scripts/align_llama.sh (not part of this script).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -91,6 +91,11 @@ run_pack_lock() {
         if [[ -n "${PROMPT_IDS}" ]]; then
             require_line "${TOKENIZE_OUTPUT}" "token_ids=${PROMPT_IDS}" "${PACK_NAME} tokenize ids"
         fi
+        if GEN_ERR="$("${BIN}" generate "${MANIFEST}" "${PROMPT}" 1 2>&1)"; then
+            echo "${GEN_ERR}" >&2
+            die "${PACK_NAME} generate must fail until the native adapter exists"
+        fi
+        require_contains "${GEN_ERR}" "尚未实现该 adapter" "${PACK_NAME} generate adapter error"
     fi
 }
 

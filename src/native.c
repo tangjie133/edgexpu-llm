@@ -42,6 +42,39 @@ static const edgexpu_arch_tensor_names *session_tensors(const edgexpu_native_ses
     return edgexpu_arch_tensors_llama_gguf();
 }
 
+static int session_attn_head_dim(const edgexpu_native_session *session) {
+    int dim;
+    int i;
+    if (session == NULL) {
+        return 0;
+    }
+    dim = edgexpu_gguf_attn_head_dim(&session->gguf);
+    if (session->layer0.ready && session->layer0.head_dim > dim) {
+        dim = session->layer0.head_dim;
+    }
+    if (session->layers != NULL) {
+        for (i = 0; i < session->n_layers_cached; i++) {
+            if (session->layers[i].head_dim > dim) {
+                dim = session->layers[i].head_dim;
+            }
+        }
+    }
+    return dim;
+}
+
+static int session_attn_inner(const edgexpu_native_session *session) {
+    int n_heads;
+    int inner;
+    int n_embd;
+    if (session == NULL) {
+        return 0;
+    }
+    n_heads = session->gguf.head_count > 0 ? (int)session->gguf.head_count : 1;
+    inner = n_heads * session_attn_head_dim(session);
+    n_embd = (int)session->gguf.embedding_length;
+    return inner > n_embd ? inner : n_embd;
+}
+
 static int admit_session_window(
     const edgexpu_native_session *session,
     int window,
@@ -283,6 +316,14 @@ static void layer_free(edgexpu_native_layer *layer) {
     }
     free(layer->attn_norm);
     free(layer->ffn_norm);
+    free(layer->attn_q_norm);
+    free(layer->attn_k_norm);
+    free(layer->ssm_conv);
+    free(layer->ssm_dt);
+    free(layer->ssm_a);
+    free(layer->ssm_norm);
+    free(layer->conv_state);
+    free(layer->ssm_state);
     free(layer->bq);
     free(layer->bk);
     free(layer->bv);
@@ -371,7 +412,19 @@ static int load_qweight(
     src = tensor_bytes(session, tensor);
     n = edgexpu_gguf_tensor_elements(tensor);
     if (src == NULL || n != (uint64_t)n_out * (uint64_t)n_in) {
-        snprintf(error, error_size, "缺少或形状不匹配的 tensor: %s", name);
+        snprintf(
+            error,
+            error_size,
+            "缺少或形状不匹配的 tensor: %s (have %llu want %d*%d dims=%u [%llu,%llu] type=%u)",
+            name,
+            (unsigned long long)n,
+            n_out,
+            n_in,
+            tensor != NULL ? tensor->n_dims : 0,
+            tensor != NULL ? (unsigned long long)tensor->dims[0] : 0,
+            tensor != NULL ? (unsigned long long)tensor->dims[1] : 0,
+            tensor != NULL ? tensor->type : 0
+        );
         return 0;
     }
     if (edgexpu_gguf_row_bytes(tensor->type, n_in) == 0) {
@@ -422,7 +475,190 @@ static double native_now_seconds(void) {
     return 0.0;
 }
 
-/* 按 adapter 加载一层权重。QKV bias 仅在 has_qkv_bias 时必填。 */
+/* 按 adapter tensor 名 + GGUF 超参加载一层。不写死某一个模型的 blk 名。 */
+static int format_layer_tensor(
+    char *name,
+    size_t name_size,
+    const char *tmpl,
+    int layer_index,
+    char *error,
+    size_t error_size
+) {
+    if (tmpl == NULL || tmpl[0] == '\0') {
+        set_error(error, error_size, "adapter 未配置该层 tensor 名");
+        return 0;
+    }
+    if (!edgexpu_arch_format_name(name, name_size, tmpl, layer_index)) {
+        set_error(error, error_size, "tensor 名过长");
+        return 0;
+    }
+    return 1;
+}
+
+static int load_qweight_gguf_shape(
+    edgexpu_native_session *session,
+    const char *tmpl,
+    int layer_index,
+    edgexpu_qweight *weight,
+    char *error,
+    size_t error_size
+) {
+    char name[96];
+    const edgexpu_gguf_tensor *tensor;
+    if (!format_layer_tensor(name, sizeof(name), tmpl, layer_index, error, error_size)) {
+        return 0;
+    }
+    tensor = edgexpu_gguf_find_tensor(&session->gguf, name);
+    if (tensor == NULL || tensor->n_dims < 2) {
+        snprintf(error, error_size, "缺少 tensor: %s", name);
+        return 0;
+    }
+    return load_qweight(
+        session,
+        name,
+        (int)tensor->dims[1],
+        (int)tensor->dims[0],
+        weight,
+        error,
+        error_size
+    );
+}
+
+static int load_layer_gated_delta(
+    edgexpu_native_session *session,
+    int layer_index,
+    edgexpu_native_layer *layer,
+    char *error,
+    size_t error_size
+) {
+    const edgexpu_arch_tensor_names *names = session_tensors(session);
+    char name[96];
+    const edgexpu_gguf_info *gg = &session->gguf;
+    int n_embd = layer->n_embd;
+    int state_elems;
+
+    if (gg->ssm_state_size == 0 || gg->ssm_group_count == 0 ||
+        gg->ssm_time_step_rank == 0 || gg->ssm_inner_size == 0 ||
+        gg->ssm_conv_kernel == 0) {
+        set_error(error, error_size, "GATED_DELTA 层缺少 ssm 超参");
+        return 0;
+    }
+    layer->ssm_dk = (int)gg->ssm_state_size;
+    layer->ssm_n_k = (int)gg->ssm_group_count;
+    layer->ssm_n_v = (int)gg->ssm_time_step_rank;
+    if (layer->ssm_n_v == 0 || (int)gg->ssm_inner_size % layer->ssm_n_v != 0) {
+        set_error(error, error_size, "GATED_DELTA inner_size 不能整除 time_step_rank");
+        return 0;
+    }
+    layer->ssm_dv = (int)gg->ssm_inner_size / layer->ssm_n_v;
+    layer->ssm_conv_k = (int)gg->ssm_conv_kernel;
+    layer->qkv_dim = layer->ssm_dk * layer->ssm_n_k * 2 + layer->ssm_dv * layer->ssm_n_v;
+    if (layer->ssm_dv <= 0 || layer->qkv_dim <= 0) {
+        set_error(error, error_size, "GATED_DELTA 超参无效");
+        return 0;
+    }
+
+#define LOAD_BLK(field, tmpl) \
+    do { \
+        if (!format_layer_tensor(name, sizeof(name), (tmpl), layer_index, error, error_size)) { \
+            return 0; \
+        } \
+        if (!load_named_weight(session, name, &layer->field, error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+#define LOAD_Q(field, tmpl, nout, nin) \
+    do { \
+        if (!format_layer_tensor(name, sizeof(name), (tmpl), layer_index, error, error_size)) { \
+            return 0; \
+        } \
+        if (!load_qweight(session, name, (nout), (nin), &layer->field, error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+
+    LOAD_BLK(attn_norm, names->attn_norm);
+    LOAD_BLK(ffn_norm, names->ffn_norm);
+    LOAD_Q(wqkv, names->attn_qkv, layer->qkv_dim, n_embd);
+    LOAD_Q(wattn_gate, names->attn_gate, layer->ssm_dv * layer->ssm_n_v, n_embd);
+    LOAD_Q(wssm_alpha, names->ssm_alpha, layer->ssm_n_v, n_embd);
+    LOAD_Q(wssm_beta, names->ssm_beta, layer->ssm_n_v, n_embd);
+    LOAD_Q(wssm_out, names->ssm_out, n_embd, layer->ssm_dv * layer->ssm_n_v);
+    LOAD_Q(wgate, names->ffn_gate, layer->n_ff, n_embd);
+    LOAD_Q(wup, names->ffn_up, layer->n_ff, n_embd);
+    LOAD_Q(wdown, names->ffn_down, n_embd, layer->n_ff);
+    LOAD_BLK(ssm_conv, names->ssm_conv1d);
+    LOAD_BLK(ssm_dt, names->ssm_dt);
+    LOAD_BLK(ssm_a, names->ssm_a);
+    LOAD_BLK(ssm_norm, names->ssm_norm);
+#undef LOAD_BLK
+#undef LOAD_Q
+
+    layer->conv_state = (float *)calloc((size_t)(layer->ssm_conv_k > 1 ? layer->ssm_conv_k - 1 : 1) *
+                                            (size_t)layer->qkv_dim,
+                                        sizeof(float));
+    state_elems = layer->ssm_n_v * layer->ssm_dk * layer->ssm_dv;
+    layer->ssm_state = (float *)calloc((size_t)state_elems, sizeof(float));
+    if (layer->conv_state == NULL || layer->ssm_state == NULL) {
+        set_error(error, error_size, "GATED_DELTA 状态分配失败");
+        return 0;
+    }
+    layer->ready = 1;
+    return 1;
+}
+
+static int load_layer_attn_qk_norm(
+    edgexpu_native_session *session,
+    int layer_index,
+    edgexpu_native_layer *layer,
+    char *error,
+    size_t error_size
+) {
+    const edgexpu_arch_tensor_names *names = session_tensors(session);
+    char name[96];
+    int n_embd = layer->n_embd;
+
+#define LOAD_BLK(field, tmpl) \
+    do { \
+        if (!format_layer_tensor(name, sizeof(name), (tmpl), layer_index, error, error_size)) { \
+            return 0; \
+        } \
+        if (!load_named_weight(session, name, &layer->field, error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+#define LOAD_Q(field, tmpl, nout, nin) \
+    do { \
+        if (!format_layer_tensor(name, sizeof(name), (tmpl), layer_index, error, error_size)) { \
+            return 0; \
+        } \
+        if (!load_qweight(session, name, (nout), (nin), &layer->field, error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+
+    LOAD_BLK(attn_norm, names->attn_norm);
+    LOAD_BLK(ffn_norm, names->ffn_norm);
+    LOAD_BLK(attn_q_norm, names->attn_q_norm);
+    LOAD_BLK(attn_k_norm, names->attn_k_norm);
+    if (!load_qweight_gguf_shape(session, names->attn_q, layer_index, &layer->wq, error, error_size) ||
+        !load_qweight_gguf_shape(session, names->attn_k, layer_index, &layer->wk, error, error_size) ||
+        !load_qweight_gguf_shape(session, names->attn_v, layer_index, &layer->wv, error, error_size) ||
+        !load_qweight_gguf_shape(session, names->attn_output, layer_index, &layer->wo, error, error_size)) {
+        return 0;
+    }
+    if (layer->n_kv_heads > 0 && layer->wk.n_out % layer->n_kv_heads == 0) {
+        layer->head_dim = layer->wk.n_out / layer->n_kv_heads;
+    }
+    LOAD_Q(wgate, names->ffn_gate, layer->n_ff, n_embd);
+    LOAD_Q(wup, names->ffn_up, layer->n_ff, n_embd);
+    LOAD_Q(wdown, names->ffn_down, n_embd, layer->n_ff);
+#undef LOAD_BLK
+#undef LOAD_Q
+    layer->ready = 1;
+    return 1;
+}
+
 static int load_layer_into(
     edgexpu_native_session *session,
     int layer_index,
@@ -433,21 +669,43 @@ static int load_layer_into(
     const edgexpu_arch_tensor_names *names = session_tensors(session);
     char name[96];
 
-    if (edgexpu_arch_layer_kind(&session->arch, &session->gguf, layer_index) != EDGEXPU_LAYER_ATTN_SWIGLU) {
-        snprintf(error, error_size, "layer %d 不是 cpu.native 已实现的 ATTN+SwiGLU block", layer_index);
+    edgexpu_layer_kind kind;
+
+    kind = edgexpu_arch_layer_kind(&session->arch, &session->gguf, layer_index);
+    if (kind != EDGEXPU_LAYER_ATTN_SWIGLU &&
+        kind != EDGEXPU_LAYER_GATED_DELTA &&
+        kind != EDGEXPU_LAYER_ATTN_QK_NORM) {
+        snprintf(error, error_size, "layer %d 不是 cpu.native 已实现的 block", layer_index);
         return 0;
     }
 
     layer_free(layer);
+    layer->kind = kind;
     layer->n_embd = (int)session->gguf.embedding_length;
     layer->n_ff = (int)session->gguf.feed_forward_length;
     layer->n_heads = (int)session->gguf.head_count;
     layer->n_kv_heads = (int)session->gguf.head_count_kv;
-    layer->head_dim = edgexpu_gguf_head_dim(&session->gguf);
+    layer->head_dim = (kind == EDGEXPU_LAYER_ATTN_SWIGLU)
+        ? edgexpu_gguf_head_dim(&session->gguf)
+        : session_attn_head_dim(session);
     if (layer->n_embd <= 0 || layer->n_ff <= 0 || layer->n_heads <= 0 ||
         layer->n_kv_heads <= 0 || layer->head_dim <= 0 || layer->n_heads % layer->n_kv_heads != 0) {
         set_error(error, error_size, "native layer 架构参数无效");
         return 0;
+    }
+    if (kind == EDGEXPU_LAYER_GATED_DELTA) {
+        if (!load_layer_gated_delta(session, layer_index, layer, error, error_size)) {
+            layer_free(layer);
+            return 0;
+        }
+        return 1;
+    }
+    if (kind == EDGEXPU_LAYER_ATTN_QK_NORM) {
+        if (!load_layer_attn_qk_norm(session, layer_index, layer, error, error_size)) {
+            layer_free(layer);
+            return 0;
+        }
+        return 1;
     }
 
 #define LOAD_BLK(field, tmpl) \
@@ -683,7 +941,10 @@ static int ensure_decode_scratch(
     n_ff = session->layers[0].n_ff;
     n_heads = session->layers[0].n_heads;
     n_kv = session->layers[0].n_kv_heads;
-    head_dim = session->layers[0].head_dim;
+    head_dim = session_attn_head_dim(session);
+    if (head_dim < session->layers[0].head_dim) {
+        head_dim = session->layers[0].head_dim;
+    }
     if (cap_seq < 1) {
         cap_seq = 1;
     }
@@ -715,7 +976,7 @@ static int ensure_decode_scratch(
     ws->q = (float *)malloc((size_t)n_heads * (size_t)head_dim * sizeof(float));
     ws->k = (float *)malloc((size_t)n_kv * (size_t)head_dim * sizeof(float));
     ws->v = (float *)malloc((size_t)n_kv * (size_t)head_dim * sizeof(float));
-    ws->attn = (float *)malloc((size_t)n_embd * sizeof(float));
+    ws->attn = (float *)malloc((size_t)session_attn_inner(session) * sizeof(float));
     ws->proj = (float *)malloc((size_t)n_embd * sizeof(float));
     ws->gate = (float *)malloc((size_t)n_ff * sizeof(float));
     ws->up = (float *)malloc((size_t)n_ff * sizeof(float));
@@ -794,7 +1055,7 @@ int edgexpu_native_load(
         return 0;
     }
 
-    head_dim = edgexpu_gguf_head_dim(&session->gguf);
+    head_dim = session_attn_head_dim(session);
     max_seq = EDGEXPU_KV_DEFAULT_MAX_SEQ;
     if (session->gguf.context_length > 0 && (int)session->gguf.context_length < max_seq) {
         max_seq = (int)session->gguf.context_length;
@@ -963,7 +1224,7 @@ int edgexpu_native_ensure_window(
 
     n_layers = (int)session->gguf.block_count;
     n_kv = (int)session->gguf.head_count_kv;
-    head_dim = edgexpu_gguf_head_dim(&session->gguf);
+    head_dim = session_attn_head_dim(session);
     if (n_layers <= 0 || n_kv <= 0 || head_dim <= 0) {
         set_error(error, error_size, "native KV 架构参数无效");
         return 0;
@@ -1001,6 +1262,415 @@ int edgexpu_native_reserve_kv(
     return edgexpu_kv_cache_extend(&session->kv, tokens, error, error_size);
 }
 
+static void apply_rope_n_rot(
+    const edgexpu_native_session *session,
+    float *x,
+    int n_heads,
+    int head_dim,
+    int pos
+) {
+    int h;
+    float freq = default_rope_freq(session);
+    int n_rot = session->gguf.rope_dimension_count > 0
+        ? (int)session->gguf.rope_dimension_count
+        : head_dim;
+    if (n_rot > head_dim || n_rot < 2) {
+        n_rot = head_dim;
+    }
+    /* 文本位置 t=h=w=e 时，MRoPE 退化为对 n_rot 维做 NeoX RoPE，不能按 section 各自用一套频率。 */
+    for (h = 0; h < n_heads; h++) {
+        edgexpu_cpu_rope_neox(x + (size_t)h * (size_t)head_dim, 1, n_rot, pos, freq);
+    }
+}
+
+static int apply_swiglu_ffn(
+    const edgexpu_native_layer *layer,
+    int seq,
+    float *hidden,
+    float *normed,
+    float *gate,
+    float *up,
+    float *down,
+    float eps
+) {
+    int n_embd = layer->n_embd;
+    int n_ff = layer->n_ff;
+    int t;
+    float *ffn_in = (float *)malloc((size_t)seq * (size_t)n_embd * sizeof(float));
+    if (eps <= 0.0f) {
+        eps = 1e-6f;
+    }
+    if (ffn_in == NULL) {
+        return 0;
+    }
+    memcpy(ffn_in, hidden, (size_t)seq * (size_t)n_embd * sizeof(float));
+    for (t = 0; t < seq; t++) {
+        edgexpu_cpu_rmsnorm(
+            normed + (size_t)t * (size_t)n_embd,
+            ffn_in + (size_t)t * (size_t)n_embd,
+            layer->ffn_norm,
+            n_embd,
+            eps
+        );
+    }
+    apply_qlinear_batch(gate, normed, &layer->wgate, layer->bgate, seq);
+    apply_qlinear_batch(up, normed, &layer->wup, layer->bup, seq);
+    for (t = 0; t < seq; t++) {
+        float *g = gate + (size_t)t * (size_t)n_ff;
+        float *u = up + (size_t)t * (size_t)n_ff;
+        edgexpu_cpu_silu(g, g, n_ff);
+        edgexpu_cpu_mul(g, g, u, n_ff);
+    }
+    apply_qlinear_batch(down, gate, &layer->wdown, layer->bdown, seq);
+    for (t = 0; t < seq; t++) {
+        edgexpu_cpu_add(
+            hidden + (size_t)t * (size_t)n_embd,
+            ffn_in + (size_t)t * (size_t)n_embd,
+            down + (size_t)t * (size_t)n_embd,
+            n_embd
+        );
+    }
+    free(ffn_in);
+    return 1;
+}
+
+static void gdn_conv1d_token(
+    const edgexpu_native_layer *layer,
+    const float *mixed,
+    float *out
+) {
+    int k;
+    int c;
+    int K = layer->ssm_conv_k;
+    int C = layer->qkv_dim;
+    int hist = K > 1 ? K - 1 : 0;
+    for (c = 0; c < C; c++) {
+        float acc = 0.0f;
+        for (k = 0; k < K; k++) {
+            const float *src;
+            int lag = K - 1 - k;
+            if (lag == 0) {
+                src = mixed;
+            } else {
+                src = layer->conv_state + (size_t)(hist - lag) * (size_t)C;
+            }
+            acc += layer->ssm_conv[(size_t)c * (size_t)K + (size_t)k] * src[c];
+        }
+        out[c] = acc;
+    }
+    if (hist > 0) {
+        if (hist > 1) {
+            memmove(layer->conv_state, layer->conv_state + C, (size_t)(hist - 1) * (size_t)C * sizeof(float));
+        }
+        memcpy(layer->conv_state + (size_t)(hist - 1) * (size_t)C, mixed, (size_t)C * sizeof(float));
+    }
+}
+
+static int apply_gated_delta_layer(
+    edgexpu_native_session *session,
+    edgexpu_native_layer *layer,
+    int seq,
+    float *hidden,
+    float *normed,
+    float *gate,
+    float *up,
+    float *down,
+    char *error,
+    size_t error_size
+) {
+    int t;
+    int h;
+    int n_embd = layer->n_embd;
+    int dk = layer->ssm_dk;
+    int dv = layer->ssm_dv;
+    int n_k = layer->ssm_n_k;
+    int n_v = layer->ssm_n_v;
+    int qkv_dim = layer->qkv_dim;
+    int value_dim = dv * n_v;
+    int k_dim = dk * n_k;
+    float eps = session->gguf.rms_eps > 0.0f ? session->gguf.rms_eps : 1e-6f;
+    float *mixed = NULL;
+    float *conv_y = NULL;
+    float *z = NULL;
+    float *alpha = NULL;
+    float *beta = NULL;
+    float *core = NULL;
+    float *proj = NULL;
+    int ok = 0;
+
+    (void)session;
+    mixed = (float *)malloc((size_t)qkv_dim * sizeof(float));
+    conv_y = (float *)malloc((size_t)qkv_dim * sizeof(float));
+    z = (float *)malloc((size_t)seq * (size_t)value_dim * sizeof(float));
+    alpha = (float *)malloc((size_t)n_v * sizeof(float));
+    beta = (float *)malloc((size_t)n_v * sizeof(float));
+    core = (float *)malloc((size_t)seq * (size_t)value_dim * sizeof(float));
+    proj = (float *)malloc((size_t)seq * (size_t)n_embd * sizeof(float));
+    if (mixed == NULL || conv_y == NULL || z == NULL || alpha == NULL || beta == NULL ||
+        core == NULL || proj == NULL) {
+        set_error(error, error_size, "GATED_DELTA workspace 分配失败");
+        goto done;
+    }
+
+    for (t = 0; t < seq; t++) {
+        float *xt = hidden + (size_t)t * (size_t)n_embd;
+        float *nt = normed + (size_t)t * (size_t)n_embd;
+        edgexpu_cpu_rmsnorm(nt, xt, layer->attn_norm, n_embd, eps);
+        apply_qlinear(mixed, nt, &layer->wqkv, NULL);
+        apply_qlinear(z + (size_t)t * (size_t)value_dim, nt, &layer->wattn_gate, NULL);
+        apply_qlinear(alpha, nt, &layer->wssm_alpha, layer->ssm_dt);
+        apply_qlinear(beta, nt, &layer->wssm_beta, NULL);
+        edgexpu_cpu_sigmoid(beta, n_v);
+        edgexpu_cpu_softplus(alpha, n_v);
+        for (h = 0; h < n_v; h++) {
+            alpha[h] *= layer->ssm_a[h];
+        }
+        gdn_conv1d_token(layer, mixed, conv_y);
+        edgexpu_cpu_silu(conv_y, conv_y, qkv_dim);
+        for (h = 0; h < n_v; h++) {
+            int kh = n_k > 0 ? (h % n_k) : 0;
+            float *q = conv_y + (size_t)kh * (size_t)dk;
+            float *k = conv_y + (size_t)k_dim + (size_t)kh * (size_t)dk;
+            float *v = conv_y + (size_t)k_dim * 2 + (size_t)h * (size_t)dv;
+            float qn[256];
+            float kn[256];
+            if (dk > 256 || dv > 256) {
+                set_error(error, error_size, "GATED_DELTA head dim 超出临时缓冲");
+                goto done;
+            }
+            memcpy(qn, q, (size_t)dk * sizeof(float));
+            memcpy(kn, k, (size_t)dk * sizeof(float));
+            edgexpu_cpu_l2_normalize(qn, dk, eps);
+            edgexpu_cpu_l2_normalize(kn, dk, eps);
+            edgexpu_cpu_gated_delta_step(
+                layer->ssm_state + (size_t)h * (size_t)dk * (size_t)dv,
+                qn,
+                kn,
+                v,
+                alpha[h],
+                beta[h],
+                core + (size_t)t * (size_t)value_dim + (size_t)h * (size_t)dv,
+                dk,
+                dv
+            );
+        }
+        for (h = 0; h < n_v; h++) {
+            float *yh = core + (size_t)t * (size_t)value_dim + (size_t)h * (size_t)dv;
+            float *zh = z + (size_t)t * (size_t)value_dim + (size_t)h * (size_t)dv;
+            float tmp[256];
+            int i;
+            edgexpu_cpu_rmsnorm(tmp, yh, layer->ssm_norm, dv, eps);
+            edgexpu_cpu_silu(zh, zh, dv);
+            for (i = 0; i < dv; i++) {
+                yh[i] = tmp[i] * zh[i];
+            }
+        }
+    }
+    apply_qlinear_batch(proj, core, &layer->wssm_out, NULL, seq);
+    for (t = 0; t < seq; t++) {
+        edgexpu_cpu_add(
+            hidden + (size_t)t * (size_t)n_embd,
+            hidden + (size_t)t * (size_t)n_embd,
+            proj + (size_t)t * (size_t)n_embd,
+            n_embd
+        );
+    }
+    if (!apply_swiglu_ffn(layer, seq, hidden, normed, gate, up, down, eps)) {
+        set_error(error, error_size, "SwiGLU FFN workspace 分配失败");
+        goto done;
+    }
+    ok = 1;
+done:
+    free(mixed);
+    free(conv_y);
+    free(z);
+    free(alpha);
+    free(beta);
+    free(core);
+    free(proj);
+    return ok;
+}
+
+static int apply_attn_qk_norm_layer(
+    edgexpu_native_session *session,
+    const edgexpu_native_layer *layer,
+    int layer_index,
+    int seq,
+    int pos_base,
+    float *hidden,
+    float *normed,
+    float *q,
+    float *k,
+    float *v,
+    float *attn,
+    float *proj,
+    float *gate,
+    float *up,
+    float *down,
+    float *scores,
+    char *error,
+    size_t error_size
+) {
+    int n_embd = layer->n_embd;
+    int n_heads = layer->n_heads;
+    int n_kv = layer->n_kv_heads;
+    int head_dim = layer->head_dim;
+    int n_rep = n_heads / n_kv;
+    int t;
+    int h;
+    float eps = session->gguf.rms_eps > 0.0f ? session->gguf.rms_eps : 1e-6f;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float *q_full = NULL;
+    float *q_use = NULL;
+    float *gate_h = NULL;
+    int q_stride = layer->wq.n_out / n_heads;
+    if (q_stride < head_dim) {
+        q_stride = head_dim * 2;
+    }
+
+    q_full = (float *)malloc((size_t)seq * (size_t)n_heads * (size_t)q_stride * sizeof(float));
+    q_use = (float *)malloc((size_t)seq * (size_t)n_heads * (size_t)head_dim * sizeof(float));
+    gate_h = (float *)malloc((size_t)seq * (size_t)n_heads * (size_t)head_dim * sizeof(float));
+    if (q_full == NULL || q_use == NULL || gate_h == NULL) {
+        free(q_full);
+        free(q_use);
+        free(gate_h);
+        set_error(error, error_size, "ATTN_QK_NORM workspace 分配失败");
+        return 0;
+    }
+
+    for (t = 0; t < seq; t++) {
+        edgexpu_cpu_rmsnorm(
+            normed + (size_t)t * (size_t)n_embd,
+            hidden + (size_t)t * (size_t)n_embd,
+            layer->attn_norm,
+            n_embd,
+            eps
+        );
+    }
+    apply_qlinear_batch(q_full, normed, &layer->wq, NULL, seq);
+    apply_qlinear_batch(k, normed, &layer->wk, NULL, seq);
+    apply_qlinear_batch(v, normed, &layer->wv, NULL, seq);
+    for (t = 0; t < seq; t++) {
+        for (h = 0; h < n_heads; h++) {
+            float *src = q_full + ((size_t)t * (size_t)n_heads + (size_t)h) * (size_t)q_stride;
+            float *qd = q_use + ((size_t)t * (size_t)n_heads + (size_t)h) * (size_t)head_dim;
+            float *gd = gate_h + ((size_t)t * (size_t)n_heads + (size_t)h) * (size_t)head_dim;
+            memcpy(qd, src, (size_t)head_dim * sizeof(float));
+            if (q_stride >= head_dim * 2) {
+                memcpy(gd, src + head_dim, (size_t)head_dim * sizeof(float));
+            } else {
+                memset(gd, 0, (size_t)head_dim * sizeof(float));
+            }
+            edgexpu_cpu_rmsnorm(qd, qd, layer->attn_q_norm, head_dim, eps);
+        }
+        for (h = 0; h < n_kv; h++) {
+            float *kd = k + ((size_t)t * (size_t)n_kv + (size_t)h) * (size_t)head_dim;
+            edgexpu_cpu_rmsnorm(kd, kd, layer->attn_k_norm, head_dim, eps);
+        }
+        apply_rope_n_rot(
+            session,
+            q_use + (size_t)t * (size_t)n_heads * (size_t)head_dim,
+            n_heads,
+            head_dim,
+            pos_base + t
+        );
+        apply_rope_n_rot(
+            session,
+            k + (size_t)t * (size_t)n_kv * (size_t)head_dim,
+            n_kv,
+            head_dim,
+            pos_base + t
+        );
+    }
+
+    for (t = 0; t < seq; t++) {
+        for (h = 0; h < n_heads; h++) {
+            int kv_h = h / n_rep;
+            float *qh = q_use + ((size_t)t * (size_t)n_heads + (size_t)h) * (size_t)head_dim;
+            float *out_h = attn + ((size_t)t * (size_t)n_heads + (size_t)h) * (size_t)head_dim;
+            int s;
+            for (s = 0; s <= pos_base + t; s++) {
+                float *kh;
+                if (s < pos_base) {
+                    kh = edgexpu_kv_cache_k_at(&session->kv, layer_index, s);
+                    if (kh == NULL) {
+                        free(q_full);
+                        free(q_use);
+                        free(gate_h);
+                        set_error(error, error_size, "native decode 无法读取 K");
+                        return 0;
+                    }
+                    kh += (size_t)kv_h * (size_t)head_dim;
+                } else {
+                    kh = k + ((size_t)(s - pos_base) * (size_t)n_kv + (size_t)kv_h) * (size_t)head_dim;
+                }
+                scores[s] = edgexpu_cpu_dot(qh, kh, head_dim) * attn_scale;
+            }
+            edgexpu_cpu_softmax(scores, pos_base + t + 1);
+            memset(out_h, 0, (size_t)head_dim * sizeof(float));
+            for (s = 0; s <= pos_base + t; s++) {
+                float *vh;
+                if (s < pos_base) {
+                    vh = edgexpu_kv_cache_v_at(&session->kv, layer_index, s);
+                    if (vh == NULL) {
+                        free(q_full);
+                        free(q_use);
+                        free(gate_h);
+                        set_error(error, error_size, "native decode 无法读取 V");
+                        return 0;
+                    }
+                    vh += (size_t)kv_h * (size_t)head_dim;
+                } else {
+                    vh = v + ((size_t)(s - pos_base) * (size_t)n_kv + (size_t)kv_h) * (size_t)head_dim;
+                }
+                edgexpu_cpu_saxpy(out_h, vh, scores[s], head_dim);
+            }
+            {
+                float *gd = gate_h + ((size_t)t * (size_t)n_heads + (size_t)h) * (size_t)head_dim;
+                int i;
+                for (i = 0; i < head_dim; i++) {
+                    gd[i] = 1.0f / (1.0f + expf(-gd[i]));
+                    out_h[i] *= gd[i];
+                }
+            }
+        }
+    }
+
+    for (t = 0; t < seq; t++) {
+        float *k_slot = edgexpu_kv_cache_k_at(&session->kv, layer_index, pos_base + t);
+        float *v_slot = edgexpu_kv_cache_v_at(&session->kv, layer_index, pos_base + t);
+        if (k_slot == NULL || v_slot == NULL) {
+            free(q_full);
+            free(q_use);
+            free(gate_h);
+            set_error(error, error_size, "native prefill 无法写入 KV cache");
+            return 0;
+        }
+        memcpy(k_slot, k + (size_t)t * (size_t)n_kv * (size_t)head_dim, (size_t)n_kv * (size_t)head_dim * sizeof(float));
+        memcpy(v_slot, v + (size_t)t * (size_t)n_kv * (size_t)head_dim, (size_t)n_kv * (size_t)head_dim * sizeof(float));
+    }
+
+    apply_qlinear_batch(proj, attn, &layer->wo, NULL, seq);
+    for (t = 0; t < seq; t++) {
+        edgexpu_cpu_add(
+            hidden + (size_t)t * (size_t)n_embd,
+            hidden + (size_t)t * (size_t)n_embd,
+            proj + (size_t)t * (size_t)n_embd,
+            n_embd
+        );
+    }
+    free(q_full);
+    free(q_use);
+    free(gate_h);
+    (void)q;
+    if (!apply_swiglu_ffn(layer, seq, hidden, normed, gate, up, down, eps)) {
+        set_error(error, error_size, "SwiGLU FFN workspace 分配失败");
+        return 0;
+    }
+    return 1;
+}
+
 /* 一层：RMSNorm → QKV(+RoPE) → GQA attention → 残差 → SwiGLU FFN。
  * prefill 把同一线性层的全部 token 一次算完，让量化权重行留在 cache 里。 */
 static int apply_transformer_layer(
@@ -1031,6 +1701,43 @@ static int apply_transformer_layer(
     int t;
     float eps = session->gguf.rms_eps > 0.0f ? session->gguf.rms_eps : 1e-6f;
     float attn_scale = 1.0f / sqrtf((float)head_dim);
+
+    if (layer->kind == EDGEXPU_LAYER_GATED_DELTA) {
+        return apply_gated_delta_layer(
+            session,
+            (edgexpu_native_layer *)layer,
+            seq,
+            hidden,
+            normed,
+            gate,
+            up,
+            down,
+            error,
+            error_size
+        );
+    }
+    if (layer->kind == EDGEXPU_LAYER_ATTN_QK_NORM) {
+        return apply_attn_qk_norm_layer(
+            session,
+            layer,
+            layer_index,
+            seq,
+            0,
+            hidden,
+            normed,
+            q,
+            k,
+            v,
+            attn,
+            proj,
+            gate,
+            up,
+            down,
+            scores,
+            error,
+            error_size
+        );
+    }
 
     for (t = 0; t < seq; t++) {
         edgexpu_cpu_rmsnorm(
@@ -1167,7 +1874,7 @@ int edgexpu_native_forward_prefill(
     n_ff = session->layers[0].n_ff;
     n_heads = session->layers[0].n_heads;
     n_kv = session->layers[0].n_kv_heads;
-    head_dim = session->layers[0].head_dim;
+    head_dim = session_attn_head_dim(session);
     seq = session->token_count;
     if (seq > session->kv.max_seq) {
         snprintf(
@@ -1193,7 +1900,7 @@ int edgexpu_native_forward_prefill(
     q = (float *)malloc((size_t)seq * (size_t)n_heads * (size_t)head_dim * sizeof(float));
     k = (float *)malloc((size_t)seq * (size_t)n_kv * (size_t)head_dim * sizeof(float));
     v = (float *)malloc((size_t)seq * (size_t)n_kv * (size_t)head_dim * sizeof(float));
-    attn = (float *)calloc((size_t)seq * (size_t)n_embd, sizeof(float));
+    attn = (float *)calloc((size_t)seq * (size_t)session_attn_inner(session), sizeof(float));
     proj = (float *)malloc((size_t)seq * (size_t)n_embd * sizeof(float));
     gate = (float *)malloc((size_t)seq * (size_t)n_ff * sizeof(float));
     up = (float *)malloc((size_t)seq * (size_t)n_ff * sizeof(float));
@@ -1215,6 +1922,23 @@ int edgexpu_native_forward_prefill(
     }
 
     edgexpu_kv_cache_reset(&session->kv);
+    for (layer_index = 0; layer_index < n_layers; layer_index++) {
+        edgexpu_native_layer *ly = &session->layers[layer_index];
+        if (ly->conv_state != NULL && ly->qkv_dim > 0 && ly->ssm_conv_k > 1) {
+            memset(
+                ly->conv_state,
+                0,
+                (size_t)(ly->ssm_conv_k - 1) * (size_t)ly->qkv_dim * sizeof(float)
+            );
+        }
+        if (ly->ssm_state != NULL && ly->ssm_n_v > 0 && ly->ssm_dk > 0 && ly->ssm_dv > 0) {
+            memset(
+                ly->ssm_state,
+                0,
+                (size_t)ly->ssm_n_v * (size_t)ly->ssm_dk * (size_t)ly->ssm_dv * sizeof(float)
+            );
+        }
+    }
     for (layer_index = 0; layer_index < n_layers; layer_index++) {
         if (!apply_transformer_layer(
                 session,
@@ -1424,7 +2148,7 @@ static int forward_decode_token(
     n_ff = session->layers[0].n_ff;
     n_heads = session->layers[0].n_heads;
     n_kv = session->layers[0].n_kv_heads;
-    head_dim = session->layers[0].head_dim;
+    head_dim = session_attn_head_dim(session);
     n_rep = n_heads / n_kv;
     eps = session->gguf.rms_eps > 0.0f ? session->gguf.rms_eps : 1e-6f;
     attn_scale = 1.0f / sqrtf((float)head_dim);
@@ -1459,6 +2183,46 @@ static int forward_decode_token(
         float *v_slot;
 
         layer = &session->layers[layer_index];
+        if (layer->kind == EDGEXPU_LAYER_GATED_DELTA) {
+            if (!apply_gated_delta_layer(
+                    session,
+                    &session->layers[layer_index],
+                    1,
+                    hidden,
+                    normed,
+                    gate,
+                    up,
+                    down,
+                    error,
+                    error_size)) {
+                return 0;
+            }
+            continue;
+        }
+        if (layer->kind == EDGEXPU_LAYER_ATTN_QK_NORM) {
+            if (!apply_attn_qk_norm_layer(
+                    session,
+                    layer,
+                    layer_index,
+                    1,
+                    pos,
+                    hidden,
+                    normed,
+                    q,
+                    k,
+                    v,
+                    attn,
+                    proj,
+                    gate,
+                    up,
+                    down,
+                    scores,
+                    error,
+                    error_size)) {
+                return 0;
+            }
+            continue;
+        }
         edgexpu_cpu_rmsnorm(normed, hidden, layer->attn_norm, n_embd, eps);
         apply_qlinear(q, normed, &layer->wq, layer->bq);
         apply_qlinear(k, normed, &layer->wk, layer->bk);
@@ -1674,7 +2438,7 @@ int edgexpu_native_dump_logits(
 
     n_embd = session->layer0.n_embd;
     n_kv = session->layer0.n_kv_heads;
-    head_dim = session->layer0.head_dim;
+    head_dim = session->layer0.head_dim > 0 ? session->layer0.head_dim : session_attn_head_dim(session);
     layer = &session->layer0;
     pos = session->token_count > 0 ? session->token_count - 1 : 0;
     weights = logit_weight_tensor(session);
@@ -1702,7 +2466,16 @@ int edgexpu_native_dump_logits(
 
     emb = (float *)malloc((size_t)n_embd * sizeof(float));
     normed = (float *)malloc((size_t)n_embd * sizeof(float));
-    q = (float *)malloc((size_t)n_embd * sizeof(float));
+    {
+        int q_cap = n_embd;
+        if (layer->qkv_dim > q_cap) {
+            q_cap = layer->qkv_dim;
+        }
+        if (layer->wq.n_out > q_cap) {
+            q_cap = layer->wq.n_out;
+        }
+        q = (float *)malloc((size_t)q_cap * sizeof(float));
+    }
     k = (float *)malloc((size_t)n_kv * (size_t)head_dim * sizeof(float));
     if (emb == NULL || normed == NULL || q == NULL || k == NULL || session->token_count <= 0) {
         set_error(error, error_size, "native dump layer0 缓冲分配失败");
@@ -1717,16 +2490,22 @@ int edgexpu_native_dump_logits(
                         session->gguf.rms_eps > 0.0f ? session->gguf.rms_eps : 1e-6f);
     printf("layer0_rms=%.6f\n", vector_rms(normed, n_embd));
     print_float_prefix("layer0_rms_vec", normed, n_embd, 8);
-    apply_qlinear(q, normed, &layer->wq, layer->bq);
-    apply_qlinear(k, normed, &layer->wk, layer->bk);
-    printf("layer0_q_pre_rope_rms=%.6f\n", vector_rms(q, n_embd));
-    printf("layer0_k_pre_rope_rms=%.6f\n", vector_rms(k, n_kv * head_dim));
-    apply_rope(session, q, layer->n_heads, head_dim, pos);
-    apply_rope(session, k, n_kv, head_dim, pos);
-    printf("layer0_q_rms=%.6f\n", vector_rms(q, n_embd));
-    printf("layer0_k_rms=%.6f\n", vector_rms(k, n_kv * head_dim));
-    print_float_prefix("layer0_q", q, n_embd, 8);
-    print_float_prefix("layer0_k", k, n_kv * head_dim, 8);
+    if (layer->wq.data != NULL && layer->wk.data != NULL) {
+        apply_qlinear(q, normed, &layer->wq, layer->bq);
+        apply_qlinear(k, normed, &layer->wk, layer->bk);
+        printf("layer0_q_pre_rope_rms=%.6f\n", vector_rms(q, n_embd));
+        printf("layer0_k_pre_rope_rms=%.6f\n", vector_rms(k, n_kv * head_dim));
+        apply_rope(session, q, layer->n_heads, head_dim, pos);
+        apply_rope(session, k, n_kv, head_dim, pos);
+        printf("layer0_q_rms=%.6f\n", vector_rms(q, n_embd));
+        printf("layer0_k_rms=%.6f\n", vector_rms(k, n_kv * head_dim));
+        print_float_prefix("layer0_q", q, n_embd, 8);
+        print_float_prefix("layer0_k", k, n_kv * head_dim, 8);
+    } else if (layer->wqkv.data != NULL) {
+        apply_qlinear(q, normed, &layer->wqkv, NULL);
+        printf("layer0_kind=gated_delta qkv_dim=%d qkv_rms=%.6f\n", layer->qkv_dim, vector_rms(q, layer->qkv_dim));
+        print_float_prefix("layer0_qkv", q, layer->qkv_dim, 8);
+    }
 
     if (!edgexpu_native_forward_prefill(session, error, error_size)) {
         goto cleanup;
@@ -1994,14 +2773,35 @@ int edgexpu_native_selftest(const char *gguf_path) {
         return 1;
     }
     last_layer = (int)session.gguf.block_count - 1;
-    k0 = edgexpu_kv_cache_k_at(&session.kv, 0, 0);
-    klast = last_layer >= 0 ? edgexpu_kv_cache_k_at(&session.kv, last_layer, 0) : NULL;
-    if (k0 == NULL || klast == NULL ||
-        vector_rms(k0, session.layer0.n_kv_heads * session.layer0.head_dim) <= 0.0f ||
-        vector_rms(klast, session.layer0.n_kv_heads * session.layer0.head_dim) <= 0.0f) {
-        fprintf(stderr, "native prefill KV was empty\n");
-        edgexpu_native_free(&session);
-        return 1;
+    {
+        int kv_first = -1;
+        int kv_last = -1;
+        int li;
+        int kv_dim;
+        for (li = 0; li < (int)session.gguf.block_count; li++) {
+            if (session.layers[li].kind == EDGEXPU_LAYER_GATED_DELTA) {
+                continue;
+            }
+            if (kv_first < 0) {
+                kv_first = li;
+            }
+            kv_last = li;
+        }
+        if (kv_first < 0) {
+            kv_first = 0;
+            kv_last = last_layer >= 0 ? last_layer : 0;
+        }
+        k0 = edgexpu_kv_cache_k_at(&session.kv, kv_first, 0);
+        klast = kv_last >= 0 ? edgexpu_kv_cache_k_at(&session.kv, kv_last, 0) : NULL;
+        kv_dim = session.layers[kv_last >= 0 ? kv_last : 0].n_kv_heads *
+            session.layers[kv_last >= 0 ? kv_last : 0].head_dim;
+        if (k0 == NULL || klast == NULL ||
+            vector_rms(k0, kv_dim) <= 0.0f ||
+            vector_rms(klast, kv_dim) <= 0.0f) {
+            fprintf(stderr, "native prefill KV was empty\n");
+            edgexpu_native_free(&session);
+            return 1;
+        }
     }
     if (session.prefill_layers != (int)session.gguf.block_count) {
         fprintf(stderr, "native prefill_layers=%d expected=%u\n",

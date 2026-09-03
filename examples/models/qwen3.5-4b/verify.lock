@@ -1,5 +1,5 @@
-# Hybrid qwen35：产品路径仍是 cpu.native。当前 adapter 未实现 SSM，generate 必须失败而不是改走 llama。
-# CI NATIVE=0 只锁 tokenize，直到 native_forward 完成后再锁 greedy。
-ADAPTER=unsupported
-NATIVE=0
+# Hybrid qwen35：cpu.native Gated DeltaNet + QK-norm attn。greedy n=4 对 Hello EdgeXPU。
+ADAPTER=qwen35
+NATIVE=1
 PROMPT_IDS=9419,10041,55,6126
+GREEDY_IDS=11,271,40,1044

@@ -27,7 +27,9 @@ typedef enum edgexpu_tokenizer_kind {
 
 typedef enum edgexpu_layer_kind {
     EDGEXPU_LAYER_ATTN_SWIGLU = 0, /* dense MHA + SwiGLU，cpu.native 已实现 */
-    EDGEXPU_LAYER_UNSUPPORTED = 1
+    EDGEXPU_LAYER_UNSUPPORTED = 1,
+    EDGEXPU_LAYER_GATED_DELTA = 2, /* linear attn / Gated DeltaNet */
+    EDGEXPU_LAYER_ATTN_QK_NORM = 3 /* 全量 attn：QK-RMSNorm，Q 可带 gate，FFN 前 post-attn RMSNorm */
 } edgexpu_layer_kind;
 
 /* GGUF 常见 llama.cpp 命名。模板里的 %d 是层号；无 %d 的是全局 tensor。 */
@@ -52,6 +54,17 @@ typedef struct edgexpu_arch_tensor_names {
     const char *ffn_gate_bias;
     const char *ffn_up_bias;
     const char *ffn_down_bias;
+    const char *attn_q_norm; /* 每头 Q RMSNorm；NULL 表示该层不用 */
+    const char *attn_k_norm;
+    const char *attn_qkv;    /* fused QKV，Gated DeltaNet */
+    const char *attn_gate;
+    const char *ssm_conv1d;
+    const char *ssm_dt;
+    const char *ssm_a;
+    const char *ssm_alpha;
+    const char *ssm_beta;
+    const char *ssm_norm;
+    const char *ssm_out;
 } edgexpu_arch_tensor_names;
 
 typedef struct edgexpu_arch_adapter edgexpu_arch_adapter;

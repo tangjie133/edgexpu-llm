@@ -1,6 +1,13 @@
 # EdgeXPU-LLM 测试记录
 
-这份文件是测试记录，不是项目介绍。项目定位见 `README.md`，阶段计划见 `README.plan.zh.md`。
+这份文件是测试记录，不是项目介绍。项目定位见 `README.md`，阶段计划见 `README.plan.zh.md`，贡献边界见 `CONTRIBUTING.md`。
+
+**验收口径（与 README 一致，不要和 Ollama / llama.cpp 产品路径混用）：**
+
+- 正在开发的是 EdgeXPU **自研算子**（`cpu.native`：GGUF mmap、kernel、arch plugin、executor）。
+- 日常入口只有 `bash scripts/verify_mvp.sh`，全程 native。本仓库 **不用 Ollama**。
+- `llama.cpp` 只是可选对照（`compare` / `align_llama.sh`），**不是**后端、不是默认 CI、不是缺 adapter 时的替身。
+- 架构未实现时：`generate` 必须失败并补 `src/arch/`，禁止改走 llama.cpp 或 Ollama。
 
 | 轮次 | 时间 | 对象 |
 | --- | --- | --- |
@@ -11,14 +18,54 @@
 | 第 5 轮 | 2026-09-03 ~11:10 | P0 修复后：桌面无 llama PATH + 树莓派产品入口 |
 | 第 6 轮 | 2026-09-03 ~11:30 | v0.0.7：native 成功不再探测 llama；NEON Q4_K；qemu 自动 emulated |
 | 第 7 轮 | 2026-09-03 ~13:45 | 架构插件 / backend vtable / 资源预算；Qwen3.5 识别但不做 native |
-| **第 8 轮（本次）** | **2026-09-03 ~14:05** | **`e135898` 需改规则：产品路径禁止 llama 后备；0.5B 包删除；4B 归位** |
+| 第 8 轮 | 2026-09-03 ~14:05 | `e135898` 产品路径禁止 llama 后备；0.5B 包删除；4B 归位 |
+| **第 9 轮（本次）** | **2026-09-03 ~14:15** | **`d10a074`：compare 两腿独立已提交；文档写明板上自备 SmolLM GGUF** |
 
 测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
-测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`e135898`）。板上 **无** llama-cli。本轮只记录，不改产品代码。SmolLM GGUF 不进 git；板上本无该文件，测试时从桌面拷入 101MB 后才跑通产品入口。
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`d10a074`）。板上 **无** llama-cli。本轮只记录，不改产品代码。板上 SmolLM GGUF 仍是第 8 轮拷入的 101MB。
 
 ---
 
-## 0. 第 8 轮结论（`e135898` 需改规则）
+## 0. 第 9 轮结论（`d10a074` 第8论测试修改）
+
+对照第 8 轮剩余项：`compare` 的 llama 腿已与 native load **解耦并进仓库**；`CONTRIBUTING.md` / `verify_mvp.sh` 已写明板上要自备 SmolLM GGUF。产品路径仍只用自研算子。
+
+| 项 | 第 8 轮 | 第 9 轮 |
+| --- | --- | --- |
+| 提交 | `e135898` | **`d10a074`**（compare 独立 + 文档） |
+| 桌面 `verify_mvp.sh` | 通过 | **通过** |
+| `EDGEXPU_ARM_FULL=1` | SmolLM greedy 1 pack | **通过** |
+| 板上 `verify_mvp.sh` / `verify_arm.sh` | 拷入 GGUF 后通过 | **通过**（SmolLM greedy MATCH） |
+| Qwen3.5 `generate`（有 llama-cli） | adapter 失败 | **仍失败**，不走 llama |
+| Qwen3.5 `compare`（桌面） | 当时未提交/整条失败 | **native_ok=false，llama_ok=true，exit 0** |
+| SmolLM `compare`（桌面） | 两腿 ok | **两腿 ok**（native `cpu.native`，llama `cpu.baseline`） |
+| 板上 SmolLM `compare`（无 llama） | — | **native_ok=true，llama_ok=false，exit 0** |
+| 板上 Qwen3.5 `compare` | — | **两腿都 false，exit 1**（无 adapter + 无 llama-cli，符合「对照工具两边都不可用」） |
+| 板上缺 GGUF 的提示 | 测试记录里建议 | **已写进 CONTRIBUTING 与 verify 报错文案** |
+
+### 第 8 轮 P2 本轮
+
+1. **compare 必须 native load：已关。** llama 只做独立对照，不进 `generate`/`serve`。
+2. **板上缺权重文档：已关。** 缺唯一 native GGUF 时 `verify_mvp.sh` 仍红，但文案已指向 `examples/models/smollm2-135m/`。
+
+### 仍存在（只谈自研路径）
+
+1. **Qwen3.5 自研 SSM 前向未实现。** 产品 `generate` 正确失败；这不是缺 Ollama/llama.cpp。缺口在 `src/arch/qwen35` + kernel。
+2. NPU / Windows / soak 未测。executor 仍单线程。135M 质量弱，不要用 2+2→4 当能力线。
+
+`verify_mvp.sh` 对 `NATIVE=0` 已锁 tokenize + `generate` 因缺 adapter 失败，**不**调用 llama.cpp。不要把 `compare` 的对照腿写进这条 CI。
+
+### 建议（纠正此前混用）
+
+此前把「钉死 llama 对照」写进桌面 CI（要求 `llama_ok=true`）是错的，等于把自研算子和 llama.cpp/Ollama 绑成一条产品线。
+
+1. **默认验证只保留 native。** `verify_mvp.sh` / `generate` / `serve` 继续零依赖 llama.cpp 与 Ollama。
+2. **Qwen3.5 只补自己的算子。** 实现 Attention+SSM 前向后，把该包 `NATIVE=1` 并锁 dump-logits；在此之前 `generate` 保持失败。
+3. `compare` / `align_llama.sh` 维持可选、独立；板上没有 `llama-cli` 是正常的，不作为缺陷。
+
+---
+
+## 0a. 第 8 轮结论（`e135898` 需改规则，归档）
 
 规则变成：**产品一律 `cpu.native`；llama 只给 `compare` / `align_llama.sh`。** 未实现的架构必须报缺 adapter，不得改走 llama。Qwen2.5-0.5B 参考包已从仓库去掉；native 参考包是 **SmolLM2-135M**。Qwen3.5 仍 `NATIVE=0`（只锁 tokenize），manifest 改为 `cpu.native`，4B GGUF 已放到 `examples/models/qwen3.5-4b/`。
 
@@ -326,11 +373,11 @@ verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿（需 0.5B GGUF）
 
 ## 5. 建议
 
-1. 第 5–6 轮已关 P0。板上 tok/s 仅记录；不要拿它和桌面或 llama 比达标。
-2. qemu-user 现在会自动标 `emulated=true`；`verify_arm.sh` 仍会设 `EDGEXPU_EMULATED=1`。
-3. 不要把第 3 轮桌面满载 9–20 tok/s 写进计划当回归。
-4. 4B 已在 `qwen3.5-4b/`。板上要跑产品入口需自备 SmolLM GGUF。
-5. 第 8 轮：`EDGEXPU_ARM_FULL=1` 已真正锁 SmolLM。`compare` 两腿独立；产品路径不用 llama。
+1. 产品路径只验收 `cpu.native`。不要建议接入 Ollama，也不要把 llama.cpp 写回 `generate` / `serve` / `verify_mvp.sh`。
+2. Qwen3.5 的下一刀是自研 SSM adapter，不是对照工具。
+3. 板上 tok/s 只记录，不设相对 llama.cpp 的达标线。
+4. 板上跑产品入口需自备 SmolLM GGUF（gitignore）；缺文件脚本红，不是回退到 Ollama。
+5. qemu-user 会标 `emulated=true`；不要把第 3 轮桌面满载 tok/s 当回归。
 
 ---
 

@@ -18,7 +18,23 @@ void edgexpu_cpu_add(float *out, const float *a, const float *b, int n);
 void edgexpu_cpu_mul(float *out, const float *a, const float *b, int n);
 void edgexpu_cpu_rmsnorm(float *out, const float *x, const float *weight, int n, float eps);
 void edgexpu_cpu_silu(float *out, const float *x, int n);
+void edgexpu_cpu_sigmoid(float *io, int n);
+void edgexpu_cpu_softplus(float *io, int n);
+void edgexpu_cpu_l2_normalize(float *x, int n, float eps);
 void edgexpu_cpu_softmax(float *io, int n);
+
+/* Gated DeltaNet 一步：S 为 [dk, dv] 行主序 S[i*dv+col]。g_log 是 log 衰减（再 exp）。 */
+void edgexpu_cpu_gated_delta_step(
+    float *state,
+    const float *q,
+    const float *k,
+    const float *v,
+    float g_log,
+    float beta,
+    float *out,
+    int dk,
+    int dv
+);
 
 /* out[m, n] = a[m, k] * b[k, n]，行主序。 */
 void edgexpu_cpu_matmul_f32(

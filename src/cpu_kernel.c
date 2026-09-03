@@ -251,6 +251,80 @@ void edgexpu_cpu_silu(float *out, const float *x, int n) {
     }
 }
 
+void edgexpu_cpu_sigmoid(float *io, int n) {
+    int i;
+    if (io == NULL) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        io[i] = 1.0f / (1.0f + expf(-io[i]));
+    }
+}
+
+void edgexpu_cpu_softplus(float *io, int n) {
+    int i;
+    if (io == NULL) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        float x = io[i];
+        io[i] = x > 20.0f ? x : logf(1.0f + expf(x));
+    }
+}
+
+void edgexpu_cpu_l2_normalize(float *x, int n, float eps) {
+    int i;
+    double ss = 0.0;
+    float scale;
+    if (x == NULL || n <= 0) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        ss += (double)x[i] * (double)x[i];
+    }
+    scale = 1.0f / sqrtf((float)ss + eps);
+    for (i = 0; i < n; i++) {
+        x[i] *= scale;
+    }
+}
+
+void edgexpu_cpu_gated_delta_step(
+    float *state,
+    const float *q,
+    const float *k,
+    const float *v,
+    float g_log,
+    float beta,
+    float *out,
+    int dk,
+    int dv
+) {
+    int i;
+    int col;
+    float g;
+    float scale;
+    if (state == NULL || q == NULL || k == NULL || v == NULL || out == NULL || dk <= 0 || dv <= 0) {
+        return;
+    }
+    g = expf(g_log);
+    scale = 1.0f / sqrtf((float)dv);
+    for (col = 0; col < dv; col++) {
+        float kv = 0.0f;
+        float delta;
+        float attn = 0.0f;
+        for (i = 0; i < dk; i++) {
+            kv += state[i * dv + col] * k[i];
+        }
+        delta = (v[col] - g * kv) * beta;
+        for (i = 0; i < dk; i++) {
+            float s = g * state[i * dv + col] + k[i] * delta;
+            state[i * dv + col] = s;
+            attn += s * q[i];
+        }
+        out[col] = attn * scale;
+    }
+}
+
 void edgexpu_cpu_softmax(float *io, int n) {
     int i;
     float max_value;

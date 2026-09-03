@@ -23,6 +23,18 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 
 如果项目最终只是把 `llama.cpp` 包成 OpenAI-compatible API，那它只是一个 baseline adapter，不是 EdgeXPU-LLM 的核心。EdgeXPU-LLM 的核心价值应该来自 native runtime contract、async executor、设备能力 profiling、scheduler、cache policy、memory policy，以及未来的 accelerator routing。
 
+## 架构插件 vs native kernel
+
+`cpu.native` 按**层类型**跑算子，不按模型名分支。
+
+| 层 | 改哪里 | 禁止 |
+| --- | --- | --- |
+| 新 GGUF `general.architecture` | `src/arch/<id>.c`：`match` / `configure`（RoPE、tensor 名）/ `layer_kind`；`register.c` 登记 | 在 `src/native.c` 写 `load_layer_<model>` 或写死 `blk.%d.*` |
+| 新算子（尚无 kernel） | `cpu_kernel` + native 按 `edgexpu_layer_kind` 分发 | 把缺 kernel 写成 llama 后备 |
+| 换权重 / chat 模板 | `examples/models/<pack>/` + `verify.lock` | 改 runtime 默认 chat 标记 |
+
+已有 `layer_kind`：`ATTN_SWIGLU`、`GATED_DELTA`、`ATTN_QK_NORM`。hybrid 模型（如 Qwen3.5）只在 plugin 里选层类型并填 tensor 表；forward 复用这三套 kernel。细节见 `CONTRIBUTING.md`。
+
 ## 当前状态
 
 当前仓库已经有一套 native C MVP 骨架：
@@ -41,8 +53,8 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 - backend-owned telemetry 第一版，并已作为下一次 scheduler plan 的输入
 - 本地 OpenAI-compatible `/v1/models` 和 `/v1/chat/completions` server
 - streaming 请求会按每个 native token 发送 SSE chunk
-- SmolLM2-135M native 参考包；Qwen3.5-4B 走同一套 cpu.native 契约（SSM 前向尚未实现）
-- GGUF `general.architecture` 插件（`src/arch/`：qwen2、llama、qwen35 识别）
+- SmolLM2-135M native 参考包；Qwen3.5-4B 是 hybrid 示例包（同一套 `cpu.native`）
+- GGUF `general.architecture` 插件（`src/arch/`：qwen2、llama、qwen35）。**新模型只加 plugin，不改 `src/native.c` 层循环**
 - 模型包 `chat_template`，runtime 不写死 chat 标记
 - 贡献入口 `CONTRIBUTING.md` 与 `examples/models/_template/`
 - MVP 验证脚本 `scripts/verify_mvp.sh`
@@ -249,7 +261,7 @@ MVP 要保持小而可验证。
 | 目录 | 角色 |
 | --- | --- |
 | `examples/models/smollm2-135m/` | **native 参考包**（adapter=`llama`）。`cpu.native`；greedy n=4 锁在该目录 `verify.lock`。权重 `SmolLM2-135M-Instruct-Q4_K_M.gguf` **不进 git**（`*.gguf` gitignore）。要跑 `generate` / `verify_mvp.sh` / ARM FULL，必须把该文件放到本目录。135M 质量有限，不要用 2+2→4 当能力验收。 |
-| `examples/models/qwen3.5-4b/` | 同一套 `cpu.native` 契约。hybrid Attention+SSM **尚未实现**，所以 CI 只锁 tokenize；`generate` 会报缺 adapter，不改走 llama。GGUF context 262144，包内 `context_length=8192` 是边缘调度窗。Pi 4GB 会被资源预算拒绝 mmap。 |
+| `examples/models/qwen3.5-4b/` | hybrid 示例（adapter=`qwen35`，`NATIVE=1`）。plugin 把层标成 `GATED_DELTA` / `ATTN_QK_NORM`，不在 `native.c` 写死模型。greedy n=4 锁在该目录 `verify.lock`。GGUF context 262144，包内 `context_length=8192` 是边缘调度窗。Pi 4GB 会被资源预算拒绝 mmap。 |
 
 加包方式见 `CONTRIBUTING.md`。不要把其它权重塞进已删除的 Qwen2.5-0.5B 目录。
 
@@ -261,7 +273,7 @@ cmake --build build --config Release
 bash scripts/verify_mvp.sh
 ```
 
-日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。某一个包缺 GGUF 会 skip 该包；但至少要有一包 `NATIVE=1` 且 GGUF 在位，否则 `verify_mvp.sh` 无法跑 generate/serve。空板需要先拷贝 SmolLM 权重。加模型或架构见 `CONTRIBUTING.md`。
+日常只跑这一条，全程 `cpu.native`。`NATIVE=0` 包锁 tokenize，以及 `generate` 因缺 adapter 失败。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。某一个包缺 GGUF 会 skip 该包；但至少要有一包 `NATIVE=1` 且 GGUF 在位，否则 `verify_mvp.sh` 无法跑 generate/serve。空板需要先拷贝 SmolLM 权重。加模型或架构见 `CONTRIBUTING.md`。
 
 llama.cpp 只是可选对照，不进默认验证：
 

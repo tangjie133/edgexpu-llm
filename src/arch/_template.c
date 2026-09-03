@@ -3,9 +3,9 @@
  *
  * 1. match()：识别 GGUF general.architecture
  * 2. configure()：填 RoPE / QKV bias / tensor 名（默认同 llama.cpp blk.%d.*）
- * 3. layer_kind()：每层 ATTN_SWIGLU 或 UNSUPPORTED（hybrid/SSM/MoE 在实现 kernel 前返回后者）
+ * 3. layer_kind()：每层 ATTN_SWIGLU / GATED_DELTA / ATTN_QK_NORM，或未实现时 UNSUPPORTED
  * 4. native_forward=1 才允许 dump-logits / generate 走 cpu.native
- * 5. 加 examples/models/<pack>/ 与 verify.lock；不要改 src/native.c 层循环
+ * 5. 加 examples/models/<pack>/ 与 verify.lock；tensor 名在 configure() 里填，不要改 src/native.c 层循环
  */
 
 #include "edgexpu/arch.h"

@@ -47,6 +47,16 @@ typedef struct edgexpu_gguf_info {
     int add_bos_token;
     float rms_eps;
     float rope_freq_base;
+    int32_t rope_sections[4];
+    uint32_t rope_dimension_count;
+    uint32_t attention_key_length;
+    uint32_t attention_value_length;
+    uint32_t full_attention_interval;
+    uint32_t ssm_conv_kernel;
+    uint32_t ssm_inner_size;
+    uint32_t ssm_state_size;
+    uint32_t ssm_time_step_rank;
+    uint32_t ssm_group_count;
     uint64_t tensor_count;
     uint64_t kv_count;
     uint64_t data_offset;
@@ -70,6 +80,9 @@ int edgexpu_gguf_load(
 
 /* embedding_length / head_count。GQA 时 KV 头更少，head_dim 仍按 query 头计算。 */
 int edgexpu_gguf_head_dim(const edgexpu_gguf_info *info);
+
+/* 全量 attn 的 Q/K 头维：优先 attention.key_length，否则从 attn_k.weight 推导。 */
+int edgexpu_gguf_attn_head_dim(const edgexpu_gguf_info *info);
 
 const edgexpu_gguf_tensor *edgexpu_gguf_find_tensor(
     const edgexpu_gguf_info *info,
