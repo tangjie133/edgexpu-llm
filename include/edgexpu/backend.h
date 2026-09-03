@@ -78,6 +78,9 @@ typedef struct edgexpu_backend {
 /* 返回临时 CPU bootstrap backend。它对应 PowerInfer/llama.cpp 风格的本地二进制调用。 */
 const edgexpu_backend *edgexpu_backend_cpu_baseline(void);
 
+/* 只记住 manifest，不探测 PATH。native 成功时用；llama generate 再真正 load。 */
+void edgexpu_backend_cpu_baseline_bind(const edgexpu_model_manifest *manifest);
+
 #ifdef __cplusplus
 }
 #endif

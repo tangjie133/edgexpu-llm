@@ -49,6 +49,39 @@ static int command_exists(const char *command) {
 #endif
 }
 
+static int detect_emulated(void) {
+    if (getenv("EDGEXPU_EMULATED") != NULL || getenv("QEMU_LD_PREFIX") != NULL) {
+        return 1;
+    }
+#if defined(__linux__) && defined(__aarch64__)
+    {
+        FILE *cpuinfo = fopen("/proc/cpuinfo", "r");
+        char line[256];
+        if (cpuinfo != NULL) {
+            while (fgets(line, sizeof(line), cpuinfo) != NULL) {
+                const char *cursor = strstr(line, "CPU implementer");
+                unsigned int implementer = 0xFFu;
+                if (cursor == NULL) {
+                    continue;
+                }
+                cursor = strchr(cursor, ':');
+                if (cursor == NULL) {
+                    continue;
+                }
+                /* qemu-user 合成 0x00；树莓派等实机是 0x41 等非零厂商号。 */
+                if (sscanf(cursor + 1, " 0x%x", &implementer) == 1 && implementer == 0u) {
+                    fclose(cpuinfo);
+                    return 1;
+                }
+                break;
+            }
+            fclose(cpuinfo);
+        }
+    }
+#endif
+    return 0;
+}
+
 int edgexpu_profile_device(edgexpu_device_profile *profile) {
     if (profile == NULL) {
         return 0;
@@ -89,9 +122,7 @@ int edgexpu_profile_device(edgexpu_device_profile *profile) {
     profile->has_rockchip_runtime = command_exists("rkllm");
     profile->has_qualcomm_runtime = command_exists("qnn-net-run");
     snprintf(profile->simd, sizeof(profile->simd), "%s", edgexpu_cpu_simd_name());
-    profile->emulated =
-        getenv("EDGEXPU_EMULATED") != NULL ||
-        getenv("QEMU_LD_PREFIX") != NULL;
+    profile->emulated = detect_emulated();
     return 1;
 }
 

@@ -308,6 +308,14 @@ static void strip_llama_cli_output(char *text, const char *prompt) {
     trim_trailing_space(text);
 }
 
+void edgexpu_backend_cpu_baseline_bind(const edgexpu_model_manifest *manifest) {
+    if (manifest == NULL) {
+        return;
+    }
+    g_loaded_manifest = *manifest;
+    g_loaded = 0;
+}
+
 static int cpu_baseline_available(void) {
     return command_exists("powerinfer") || command_exists("llama") || command_exists("llama-cli") || command_exists("main");
 }
@@ -363,8 +371,9 @@ static int cpu_baseline_generate(
     const char *extra_args;
 
     if (!g_loaded) {
-        set_error(error, error_size, "backend 尚未加载模型");
-        return 0;
+        if (!cpu_baseline_load(&g_loaded_manifest, error, error_size)) {
+            return 0;
+        }
     }
     if (request == NULL || request->prompt == NULL || result == NULL) {
         set_error(error, error_size, "生成请求参数为空");

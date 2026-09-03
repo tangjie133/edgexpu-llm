@@ -346,10 +346,12 @@ static int load_model_job_callback(
         }
     }
 
-    llama_ok = runtime->backend->load(&runtime->manifest, llama_error, sizeof(llama_error));
     if (native_ok) {
+        edgexpu_backend_cpu_baseline_bind(&runtime->manifest);
         return 1;
     }
+
+    llama_ok = runtime->backend->load(&runtime->manifest, llama_error, sizeof(llama_error));
     if (llama_ok) {
         return 1;
     }

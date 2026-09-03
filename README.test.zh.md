@@ -7,14 +7,36 @@
 | 第 1 轮 | 2026-09-03 上午 | Phase 3.0–3.2；记下 API/telemetry 问题 |
 | 第 2 轮 | 2026-09-03 ~10:00 | P1 修补回归 + ARM qemu greedy 锁点 |
 | 第 3 轮 | 2026-09-03 ~10:15 | 第 2 轮 P2 修补回归 |
-| **第 4 轮（本次）** | **2026-09-03 ~10:50** | **树莓派 4 实机 Phase 3.3** |
+| 第 4 轮 | 2026-09-03 ~10:50 | 树莓派 4 实机；发现 generate 依赖 llama（P0） |
+| **第 5 轮（本次）** | **2026-09-03 ~11:10** | **P0 修复后：桌面无 llama PATH + 树莓派产品入口** |
 
 测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
-测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM，根分区 `mmcblk0p2` ext4。仓库 `/home/a/Desktop/edgexpu-llm`。本轮 **只记录，不改代码**。
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM，根分区 `mmcblk0p2` ext4。仓库 `/home/a/Desktop/edgexpu-llm`（`2f50a1c`）。板上 **无** llama-cli。本轮只记录，不改代码。
 
 ---
 
-## 0. 第 4 轮结论（树莓派实机）
+## 0. 第 5 轮结论（P0 回归）
+
+第 4 轮 P0 **已关闭**。GGUF load 先 `native_load`，native 成功则不再要求 llama。桌面把 PATH 去掉 `/usr/local/bin`（llama-cli 所在）后 `generate` 仍出 `4`。板上无 llama，`generate` / `benchmark` / `serve` 全部可用，`backend=cpu.native`。
+
+| 项 | 第 4 轮（修前） | 第 5 轮（修后） |
+| --- | --- | --- |
+| 桌面 `verify_mvp.sh` | 通过（有 llama，掩盖 P0） | **通过** |
+| 桌面 `PATH=/usr/bin:/bin generate` | 未测 | **通过** `4` / `stop` / `cpu.native` |
+| 板上 `generate` 2+2 | 失败（要 llama-cli） | **通过** `4` / `stop` / `cpu.native` / ptok=21 |
+| 板上中文 generate n=16 | 失败 | **通过**，句子被 n 截断，`finish_reason=length` |
+| 板上 `benchmark` n=32 | 失败 | **通过** decode **8.94 tok/s**，prefill **16.67**，mem **385MB**，`finish=length` |
+| 板上 HTTP | 未测 | **通过**：`/v1/models`；2+2 → `"4"`/`stop`；n=1 → `length`；错误 model → 400 |
+| 板上 greedy 锁点 | MATCH | **MATCH**（重建后仍绿） |
+| 板上 OOM | 锁点未 OOM | n=32 后 available 仍约 3.3Gi，**swap 未用** |
+
+板上 n=32 文本与桌面同方向（含 NVIDIA 幻觉），属 Coder 0.5B，不是回归。tok/s 只作 telemetry，**无相对 llama 达标线**（板上也没有 llama）。
+
+剩余：SmolLM GGUF 仍不在板上；NPU / Windows / soak 未测。load 仍会调用一次 llama `backend->load()`（失败被忽略），不影响产品路径。
+
+---
+
+## 0b. 第 4 轮结论（树莓派实机，修前，归档）
 
 `scripts/verify_arm.sh` 在板上 **本机构建 + greedy 锁点通过**。NEON、mmap、超窗合同、与 x86 同一把 `verify.locks` 都成立。
 
@@ -154,13 +176,13 @@ verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿
 3. **0.5B 不听 system**（第 2 轮 BANANA）。模板已套上。
 4. **生成仍幻觉 NVIDIA**（Coder 0.5B）。身份已写进 manifest，不要当 Instruct 通用助手验收。
 5. **无 seed / stop / 真 JSON parser。**
-6. **NPU、Windows、soak 未测。** 树莓派见第 4 轮：锁点绿，generate 因 llama 门闩失败。
+6. **NPU、Windows、soak 未测。** 树莓派见第 5 轮：P0 已关，产品入口可用。
 
 ---
 
 ## 5. 建议
 
-1. **开发优先修 P0**：无 llama-cli 时 `generate`/`benchmark`/`serve` 应走 native（见第 4 轮）。修完后在 Pi 上复测这三条，并补 n=32 tok/s 记录。
+1. 第 5 轮已关 P0。板上 tok/s 仅记录（decode 8.94）；不要拿它和桌面 55 tok/s 或 llama 比达标。
 2. 手工 qemu 请始终 `EDGEXPU_EMULATED=1`。
 3. 不要把第 3 轮桌面满载 9–20 tok/s 写进计划当回归。
 

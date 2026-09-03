@@ -664,6 +664,49 @@ static float dot_q4_k_q8_k(const uint8_t *wrow, const uint8_t *x_q8k, int n) {
         acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
         return hsum_float_8(vacc) + _mm_cvtss_f32(acc_m);
     }
+#elif defined(EDGEXPU_NEON)
+    for (i = 0; i < nb; i++) {
+        const uint8_t *block = wrow + (size_t)i * Q4_K_BLOCK_BYTES;
+        const uint8_t *yb = x_q8k + (size_t)i * Q8_K_BLOCK_BYTES;
+        const int8_t *q8 = q8k_qs(yb);
+        const int16_t *bsums = q8k_bsums(yb);
+        const uint8_t *q4 = block + 16;
+        uint32_t utmp[4];
+        const uint8_t *scales;
+        const uint8_t *mins;
+        float d;
+        float dmin;
+        int j;
+        int sumi = 0;
+        unpack_k4_scales(block + 4, utmp);
+        scales = (const uint8_t *)&utmp[0];
+        mins = (const uint8_t *)&utmp[2];
+        d = load_fp16(block) * q8k_d(yb);
+        dmin = load_fp16(block + 2) * q8k_d(yb);
+        for (j = 0; j < QK_K / 16; j++) {
+            sumi += (int)bsums[j] * (int)mins[j / 2];
+        }
+        acc -= dmin * (float)sumi;
+        for (j = 0; j < QK_K / 64; j++) {
+            uint8x16_t q4_0 = vld1q_u8(q4);
+            uint8x16_t q4_1 = vld1q_u8(q4 + 16);
+            uint8x16_t nibble = vdupq_n_u8(0x0F);
+            int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q4_0, nibble));
+            int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q4_1, nibble));
+            int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4_0, 4));
+            int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4_1, 4));
+            int32x4_t plo = i8dot_acc(vdupq_n_s32(0), lo0, vld1q_s8(q8));
+            int32x4_t phi;
+            plo = i8dot_acc(plo, lo1, vld1q_s8(q8 + 16));
+            phi = i8dot_acc(vdupq_n_s32(0), hi0, vld1q_s8(q8 + 32));
+            phi = i8dot_acc(phi, hi1, vld1q_s8(q8 + 48));
+            acc += d * (float)((int32_t)scales[2 * j] * vaddvq_s32(plo));
+            acc += d * (float)((int32_t)scales[2 * j + 1] * vaddvq_s32(phi));
+            q4 += 32;
+            q8 += 64;
+        }
+    }
+    return acc;
 #else
     for (i = 0; i < nb; i++) {
         const uint8_t *block = wrow + (size_t)i * Q4_K_BLOCK_BYTES;
