@@ -128,6 +128,10 @@ SMOL_DUMP="$("${BIN}" dump-logits "${SMOL_GGUF}" "${PROMPT}" "${GREEDY_N}")"
 check_dump_lock "${SMOL_DUMP}" "${SMOL_PROMPT_IDS}" "${SMOL_GREEDY_IDS}" "smollm dump-logits"
 
 stage "generate"
+# PATH 上无 llama / llama-cli 时 generate 仍须走 native（树莓派 P0）。
+NO_LLAMA_DIR="$(mktemp -d)"
+PATH="${NO_LLAMA_DIR}" "${BIN}" generate "${QWEN_MANIFEST}" "What is 2+2? Answer with just the number." 8 >/dev/null
+rmdir "${NO_LLAMA_DIR}"
 BENCHMARK_OUTPUT="$("${BIN}" benchmark "${QWEN_MANIFEST}" "Explain EdgeXPU-LLM briefly.")"
 require_contains "${BENCHMARK_OUTPUT}" "\"backend\": \"cpu.native\"" "benchmark"
 require_contains "${BENCHMARK_OUTPUT}" "\"decode_seconds\"" "benchmark"

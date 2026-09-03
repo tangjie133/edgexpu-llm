@@ -6,9 +6,61 @@
 | --- | --- | --- |
 | 第 1 轮 | 2026-09-03 上午 | Phase 3.0–3.2；记下 API/telemetry 问题 |
 | 第 2 轮 | 2026-09-03 ~10:00 | P1 修补回归 + ARM qemu greedy 锁点 |
-| **第 3 轮（本次）** | **2026-09-03 ~10:15** | **第 2 轮 P2 修补回归** |
+| 第 3 轮 | 2026-09-03 ~10:15 | 第 2 轮 P2 修补回归 |
+| **第 4 轮（本次）** | **2026-09-03 ~10:50** | **树莓派 4 实机 Phase 3.3** |
 
-测试机：Linux x86_64，Intel Core Ultra 9 285K，125 GiB。第 3 轮测速时同机有大量 `cc1`/`rg`，**tok/s 不作回归结论**。
+测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM，根分区 `mmcblk0p2` ext4。仓库 `/home/a/Desktop/edgexpu-llm`。本轮 **只记录，不改代码**。
+
+---
+
+## 0. 第 4 轮结论（树莓派实机）
+
+`scripts/verify_arm.sh` 在板上 **本机构建 + greedy 锁点通过**。NEON、mmap、超窗合同、与 x86 同一把 `verify.locks` 都成立。
+
+**产品入口在板上不可用。** `generate` / `benchmark` / 凡走 `edgexpu_runtime_load_model` 的路径，在没有 `llama-cli` 时直接失败。native 前向其实已经能跑（`dump-logits` / `native-selftest` 成功），但 load 先强制走 llama bootstrap。这和文档「默认 `cpu.native`，llama 只作对照」不一致，记为 **P0**，交给开发修改。本轮未改源码。
+
+| 项 | 板上结果 |
+| --- | --- |
+| 机型 / 内存 | Pi 4B Rev 1.4，3.7Gi，swap 未用 |
+| 本机构建 | Release，OpenMP 4.5，`-march=native`，ELF aarch64 |
+| `bash scripts/verify_arm.sh` | **通过**（含 Qwen greedy n=4） |
+| dump-logits 锁点 | **MATCH** `9707,10349,55,6325` / `271,2,10349,55` |
+| capabilities | `arch=aarch64` `cpu_count=4` `memory_total_mb=3796` `simd=neon` `emulated=false` **`cpu_baseline=false`** |
+| GGUF 存储 | `/dev/mmcblk0p2` 上的 380M Qwen Q4_K_M，mmap 完成 prefill/decode（锁点路径） |
+| 推理中 OOM | **未发生**（锁点时 available 仍约 3.3Gi） |
+| `edgexpu generate` | **失败**（见 P0） |
+| `edgexpu benchmark` n=32 | **失败**（同上，未得到板上 tok/s） |
+| SmolLM 包 | 板上 **无 GGUF**（只有 manifest） |
+| HTTP | 因 generate 加载失败，**未测** |
+
+### P0：generate 仍依赖 llama-cli，不走自研 native
+
+板上报错（原文）：
+
+```text
+模型加载失败：未找到 powerinfer、llama-cli 或 manifest 指定的本地二进制
+```
+
+对照：
+
+| 入口 | 是否调用 `runtime_load_model` | 板上 |
+| --- | --- | --- |
+| `dump-logits` / `native-selftest` / `inspect-gguf` | 否，直接 `edgexpu_native_load` | 成功 |
+| `generate` / `benchmark` / `trace` / `serve` | 是 | 失败 |
+
+代码路径（供修改 agent，测试未改）：`src/runtime.c` `load_model_job_callback` **先** `runtime->backend->load()`（`src/backend.c` `cpu_baseline_load`，要求 PATH 上有 `powerinfer`/`llama`/`llama-cli`/`main`），失败则 **整次 load 返回**，后面的 `edgexpu_native_load` 根本执行不到。
+
+文档承诺：`README.md` 写 llama 仅 `compare` / `align_llama.sh` 需要；manifest `artifact.backend` 已是 `cpu.native`。实机行为与文档相反。
+
+x86 桌面有 llama-cli，此缺陷被掩盖，`verify_mvp.sh` 绿。板上 `capabilities.runtimes.cpu_baseline=false` 才暴露。
+
+建议（给开发，测试不实现）：GGUF 先 `native_load`；native 成功则不要求 llama；llama 仅 native 失败或显式 bootstrap 时再查 PATH。修完后应在无 llama 的 Pi 上复测 `generate` / `benchmark` / `serve`。
+
+### 第 4 轮环境备注（非产品缺陷）
+
+- 板上原先无 `cmake`，测试时安装了 3.31.6 才能本机构建。
+- 板上无 SmolLM GGUF，3.3 锁点只覆盖了 Qwen 参考包。
 
 ---
 
@@ -24,7 +76,7 @@
 | `EDGEXPU_ARM_FULL=1` | **ARM greedy lock passed** |
 | `edgexpu generate` | stdout 纯文本；stderr `finish_reason=stop backend=cpu.native` |
 | HTTP 413 / 分片 body | **413**；两包拼 body 后 `2+2`→`4` |
-| 树莓派实机 / NPU | **仍未测** |
+| 树莓派实机 / NPU | 见第 4 轮：ARM 锁点通过；generate 依赖 llama 未过 / NPU 仍未测 |
 
 ---
 
@@ -102,15 +154,15 @@ verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿
 3. **0.5B 不听 system**（第 2 轮 BANANA）。模板已套上。
 4. **生成仍幻觉 NVIDIA**（Coder 0.5B）。身份已写进 manifest，不要当 Instruct 通用助手验收。
 5. **无 seed / stop / 真 JSON parser。**
-6. **树莓派实机、NPU、Windows、soak 未测。**
+6. **NPU、Windows、soak 未测。** 树莓派见第 4 轮：锁点绿，generate 因 llama 门闩失败。
 
 ---
 
 ## 5. 建议
 
-1. 下一件该做的测试是 **实机 Pi**（`verify_arm.sh` 在 aarch64 上会跑 greedy 锁点），不要在这台满载 285K 上追 tok/s。
+1. **开发优先修 P0**：无 llama-cli 时 `generate`/`benchmark`/`serve` 应走 native（见第 4 轮）。修完后在 Pi 上复测这三条，并补 n=32 tok/s 记录。
 2. 手工 qemu 请始终 `EDGEXPU_EMULATED=1`。
-3. 不要把本轮 9–20 tok/s 写进计划当回归。
+3. 不要把第 3 轮桌面满载 9–20 tok/s 写进计划当回归。
 
 ---
 

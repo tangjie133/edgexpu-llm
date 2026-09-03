@@ -308,7 +308,7 @@ int edgexpu_scheduler_plan_job_with_context(
             copy_text(
                 decision->reason,
                 sizeof(decision->reason),
-                "CPU baseline backend load plus native GGUF metadata, tokenizer and KV ownership"
+                "native GGUF metadata, tokenizer and KV ownership; llama CLI is optional bootstrap"
             );
         }
         if (native->tokenizer && job_type == EDGEXPU_EXECUTOR_JOB_TOKENIZE) {

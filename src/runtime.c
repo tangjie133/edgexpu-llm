@@ -307,6 +307,14 @@ static int noop_job_callback(
     return 1;
 }
 
+static int artifact_is_gguf(const edgexpu_model_manifest *manifest) {
+    if (manifest == NULL) {
+        return 0;
+    }
+    return strcmp(manifest->primary_artifact.format, "gguf") == 0 ||
+        strstr(manifest->primary_artifact.path, ".gguf") != NULL;
+}
+
 static int load_model_job_callback(
     edgexpu_executor_job *job,
     void *user_data,
@@ -314,6 +322,10 @@ static int load_model_job_callback(
     size_t error_size
 ) {
     edgexpu_runtime *runtime = (edgexpu_runtime *)user_data;
+    char native_error[256] = {0};
+    char llama_error[256] = {0};
+    int native_ok = 0;
+    int llama_ok = 0;
 
     (void)job;
     if (runtime == NULL || runtime->backend == NULL) {
@@ -321,22 +333,35 @@ static int load_model_job_callback(
         return 0;
     }
 
-    if (!runtime->backend->load(&runtime->manifest, error, error_size)) {
-        return 0;
-    }
-
-    if (strcmp(runtime->manifest.primary_artifact.format, "gguf") == 0 ||
-        strstr(runtime->manifest.primary_artifact.path, ".gguf") != NULL) {
-        char native_error[256] = {0};
-        if (!edgexpu_native_load(
-                &runtime->native,
-                runtime->manifest.primary_artifact.path,
-                native_error,
-                sizeof(native_error))) {
+    /* GGUF 先 native_load。成功则产品路径不依赖 llama-cli；llama 只作对照/bootstrap。 */
+    if (artifact_is_gguf(&runtime->manifest)) {
+        native_ok = edgexpu_native_load(
+            &runtime->native,
+            runtime->manifest.primary_artifact.path,
+            native_error,
+            sizeof(native_error)
+        );
+        if (!native_ok) {
             edgexpu_native_free(&runtime->native);
         }
     }
-    return 1;
+
+    llama_ok = runtime->backend->load(&runtime->manifest, llama_error, sizeof(llama_error));
+    if (native_ok) {
+        return 1;
+    }
+    if (llama_ok) {
+        return 1;
+    }
+
+    if (native_error[0] != '\0') {
+        set_error(error, error_size, native_error);
+    } else if (llama_error[0] != '\0') {
+        set_error(error, error_size, llama_error);
+    } else {
+        set_error(error, error_size, "模型加载失败：native 与 llama bootstrap 均不可用");
+    }
+    return 0;
 }
 
 /* prompt 已由 generate_stream 套过 chat template。CLI tokenize 不走这条路径。 */

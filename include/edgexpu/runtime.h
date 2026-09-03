@@ -33,7 +33,7 @@ typedef struct edgexpu_runtime {
 void edgexpu_runtime_init(edgexpu_runtime *runtime);
 void edgexpu_runtime_shutdown(edgexpu_runtime *runtime);
 
-/* 加载 manifest 并选择 backend。GGUF 同时尝试 native_load。 */
+/* 加载 manifest。GGUF 先 native_load；llama CLI 仅 native 失败或 compare 时需要。 */
 int edgexpu_runtime_load_model(
     edgexpu_runtime *runtime,
     const char *manifest_path,
