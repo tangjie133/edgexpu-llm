@@ -224,6 +224,64 @@ static int resolve_artifact_path(
     return 1;
 }
 
+int edgexpu_path_is_gguf(const char *path) {
+    size_t len;
+    if (path == NULL) {
+        return 0;
+    }
+    len = strlen(path);
+    return (len >= 5 && strcmp(path + len - 5, ".gguf") == 0) ||
+        (len >= 5 && strcmp(path + len - 5, ".GGUF") == 0);
+}
+
+int edgexpu_manifest_from_gguf(
+    const char *gguf_path,
+    edgexpu_model_manifest *manifest,
+    char *error,
+    size_t error_size
+) {
+    const char *base;
+    const char *slash;
+    const char *backslash;
+    char model_id[EDGEXPU_TEXT_SMALL];
+    size_t n;
+
+    if (gguf_path == NULL || gguf_path[0] == '\0' || manifest == NULL) {
+        set_error(error, error_size, "GGUF 路径为空");
+        return 0;
+    }
+
+    memset(manifest, 0, sizeof(*manifest));
+    snprintf(manifest->primary_artifact.path, sizeof(manifest->primary_artifact.path), "%s", gguf_path);
+    snprintf(manifest->primary_artifact.format, sizeof(manifest->primary_artifact.format), "gguf");
+    snprintf(manifest->primary_artifact.backend, sizeof(manifest->primary_artifact.backend), "cpu.native");
+    snprintf(manifest->primary_artifact.command, sizeof(manifest->primary_artifact.command), "llama");
+    snprintf(manifest->fallback_policy, sizeof(manifest->fallback_policy), "cpu.baseline");
+    snprintf(manifest->family, sizeof(manifest->family), "gguf");
+    snprintf(manifest->parameter_size, sizeof(manifest->parameter_size), "unknown");
+    manifest->context_length = 8192;
+
+    slash = strrchr(gguf_path, '/');
+    backslash = strrchr(gguf_path, '\\');
+    base = gguf_path;
+    if (slash != NULL && slash + 1 > base) {
+        base = slash + 1;
+    }
+    if (backslash != NULL && backslash + 1 > base) {
+        base = backslash + 1;
+    }
+    snprintf(model_id, sizeof(model_id), "%s", base);
+    n = strlen(model_id);
+    if (n > 5 && strcmp(model_id + n - 5, ".gguf") == 0) {
+        model_id[n - 5] = '\0';
+    } else if (n > 5 && strcmp(model_id + n - 5, ".GGUF") == 0) {
+        model_id[n - 5] = '\0';
+    }
+    snprintf(manifest->model_id, sizeof(manifest->model_id), "%s", model_id);
+    snprintf(manifest->name, sizeof(manifest->name), "%s", model_id);
+    return 1;
+}
+
 int edgexpu_manifest_load(
     const char *path,
     edgexpu_model_manifest *manifest,

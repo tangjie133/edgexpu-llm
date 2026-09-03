@@ -1,0 +1,4 @@
+# Hybrid qwen35: tokenizer lock only. dump-logits / cpu.native generate are not this pack.
+ADAPTER=unsupported
+NATIVE=0
+PROMPT_IDS=9419,10041,55,6126

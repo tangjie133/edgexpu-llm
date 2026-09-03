@@ -134,6 +134,16 @@ static int load_string_array(
     if (!read_u32(file, &element_type) || !read_u64(file, &count) || element_type != GGUF_STRING) {
         return 0;
     }
+    if (count > 0xFFFFFFFFu) {
+        return 0;
+    }
+    if (is_merge) {
+        if (!edgexpu_tokenizer_reserve(tokenizer, tokenizer->vocab_size, (uint32_t)count, NULL, 0)) {
+            return 0;
+        }
+    } else if (!edgexpu_tokenizer_reserve(tokenizer, (uint32_t)count, tokenizer->n_merges, NULL, 0)) {
+        return 0;
+    }
 
     buffer = (char *)malloc(65536);
     if (buffer == NULL) {
@@ -177,7 +187,18 @@ void edgexpu_gguf_info_init(edgexpu_gguf_info *info) {
     if (info == NULL) {
         return;
     }
+    free(info->tensors);
     memset(info, 0, sizeof(*info));
+}
+
+void edgexpu_gguf_info_free(edgexpu_gguf_info *info) {
+    if (info == NULL) {
+        return;
+    }
+    free(info->tensors);
+    info->tensors = NULL;
+    info->tensors_cap = 0;
+    info->n_tensors = 0;
 }
 
 int edgexpu_gguf_head_dim(const edgexpu_gguf_info *info) {
@@ -356,10 +377,22 @@ int edgexpu_gguf_load(
         }
     }
 
-    if (info->tensor_count > EDGEXPU_GGUF_MAX_TENSORS) {
+    if (info->tensor_count > 0xFFFFFFFFu) {
         fclose(file);
-        set_error(error, error_size, "GGUF tensor 数量超出当前 loader 上限");
+        set_error(error, error_size, "GGUF tensor 数量过大");
         return 0;
+    }
+    if (info->tensor_count > 0) {
+        info->tensors = (edgexpu_gguf_tensor *)calloc(
+            (size_t)info->tensor_count,
+            sizeof(*info->tensors)
+        );
+        if (info->tensors == NULL) {
+            fclose(file);
+            set_error(error, error_size, "GGUF tensor 表分配失败");
+            return 0;
+        }
+        info->tensors_cap = (uint32_t)info->tensor_count;
     }
 
     for (tensor_index = 0; tensor_index < info->tensor_count; tensor_index++) {

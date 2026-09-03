@@ -46,6 +46,15 @@ int edgexpu_manifest_load(
     size_t error_size
 );
 
+/* 无 JSON 时直接用 GGUF：换模型只换文件，不必改 tokenizer 上限或先写 manifest。 */
+int edgexpu_path_is_gguf(const char *path);
+int edgexpu_manifest_from_gguf(
+    const char *gguf_path,
+    edgexpu_model_manifest *manifest,
+    char *error,
+    size_t error_size
+);
+
 /* 打印 manifest 摘要，供 CLI inspect 和调试阶段使用。 */
 void edgexpu_manifest_print(const edgexpu_model_manifest *manifest);
 

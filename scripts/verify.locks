@@ -1,10 +1,3 @@
-# Numerical locks for scripts/verify_mvp.sh
-# Same raw prompt, temperature=0, greedy n=4. dump-logits does not apply chat template.
+# Shared dump-logits prompt. Per-pack ids live in examples/models/<pack>/verify.lock
 PROMPT='Hello EdgeXPU'
 GREEDY_N=4
-
-QWEN_PROMPT_IDS='9707,10349,55,6325'
-QWEN_GREEDY_IDS='271,2,10349,55'
-
-SMOL_PROMPT_IDS='19556,24762,72,32736'
-SMOL_GREEDY_IDS='72,60,72,72'

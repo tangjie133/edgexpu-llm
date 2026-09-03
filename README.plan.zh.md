@@ -6,7 +6,7 @@
 
 当前项目处于 Phase 3：**功能闭环已完成；3.1 公平测速已完成；3.2 decode 已过 0.6× 停手线；3.3 ARM 交叉编译与 NEON 单元测试已可在 x86 上用 qemu 跑。** 默认 `cpu.native`；`llama cli` 仅作无 native session 时的后备，以及可选对照。
 
-还不能认为 native runtime 已完成：prefill 仍约 0.5× llama CPU；executor 仍是单线程同步；树莓派实机 greedy 锁点尚未验收；更长 prompt / 更大 GGUF 的板上内存还没压过。greedy n=4 已锁在 `scripts/verify.locks`。
+还不能认为 native runtime 已完成：prefill 仍约 0.5× llama CPU；executor 仍是单线程同步；树莓派实机 greedy 锁点尚未验收；更长 prompt / 更大 GGUF 的板上内存还没压过。greedy n=4 的 prompt 在 `scripts/verify.locks`；各包 id 在 `examples/models/<pack>/verify.lock`。
 
 余下 Phase 3 工作是 3.3 树莓派实机：NEON 构建 + 参考包 greedy 锁点 + 不 OOM / mmap。decode 不再为追 llama 改 kernel。
 
@@ -24,7 +24,7 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 
 当前实现里已经按 GGUF 读 `block_count` / `embedding_length` / KV 头数，层数不是写死 24。native forward 由 `general.architecture` 选择 adapter（当前：`qwen2`、`llama`/`mistral`）：RoPE 类型、Q/K/V bias、FFN=SwiGLU、GPT-2 BPE。chat template 在模型包 manifest，支持 `{{prompt}}` / `{{system}}` / `{{#system}}` / `{{#message}}`。runtime 不写死 `<|im_start|>`。换 Phi / Qwen3 仍需新 adapter，而不是改 `native.c` 里的默认分支。
 
-验证脚本和 `examples/models/qwen2.5-0.5b/` 可以继续用这一个包做 CI；禁止把 `qwen2.5`、24 层、`<|im_start|>` 写进 runtime 核心路径。chat template、特殊 token、RoPE 变体属于架构适配器或模型包字段。
+验证脚本扫描 `examples/models/*/verify.lock`；禁止把 `qwen2.5`、24 层、`<|im_start|>` 写进 runtime 核心路径。chat template、特殊 token、RoPE 变体属于架构适配器或模型包字段。
 
 后续加模型的正确方式：新增一个 model pack 目录 + manifest。若 `architecture` 已有适配器则应直接跑；没有则加适配器，而不是改 `native.c` 里的 Qwen 分支当默认。
 
@@ -81,7 +81,7 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 
 ### 2026-09-02：验证入口收拢
 
-- 日常只跑 `scripts/verify_mvp.sh`；greedy n=4 锁在 `scripts/verify.locks`。
+- 日常只跑 `scripts/verify_mvp.sh`；greedy n=4 的 prompt 在 `scripts/verify.locks`，各包 id 在 `examples/models/<pack>/verify.lock`。
 - `dump-logits` 的 piece / greedy_text 转义换行，避免看起来像空 piece。
 - 对照 llama.cpp 用可选的 `scripts/align_llama.sh`；默认 `verify_mvp.sh` 不调用 llama。
 
@@ -153,7 +153,7 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 - native tokenizer、KV、prefill 和逐步 decode 已接入自有 kernel；`llama cli` 只作为后备。
 - native KV 按 `prompt + max_tokens` 分配（load 占位 256），超过模型 `context_length` 报错，不再截断。
 - 层权重保持 GGUF 量化（Q4_K/Q5_K/Q4_0/Q6_K/Q5_0/Q8_0/F16/F32），flash paging 仍是 contract。
-- server streaming 按每个 native token 发送 SSE chunk；greedy 前 4 个 token 锁在 `scripts/verify.locks`。
+- server streaming 按每个 native token 发送 SSE chunk；greedy 前 4 个 token 按模型包 `verify.lock` 锁。
 - CPU fallback decode 已过桌面 0.6× 停手线（3.1 n=32：native 52.4 / llama CPU 45.2 ≈ 1.16×）。prefill 仍约 0.5×，不为追 GEMM 开阶段。
 
 ## CPU fallback 验收标准
@@ -396,7 +396,7 @@ bash scripts/verify_arm.sh
 1. ~~把 native forward 收成 architecture adapter：由 GGUF `general.architecture` 描述 RoPE / bias / FFN / tokenizer，Qwen2 只是第一个适配器实现。~~ 已做：`include/edgexpu/arch.h`，Qwen2 与 Llama/Mistral adapter。
 2. ~~模型包补齐 chat template（manifest 或 GGUF `tokenizer.chat_template`），runtime 不写死 chat 标记。~~ 已做：manifest `chat_template` + `{{prompt}}` 替换；只在 generate 路径套用。
 3. ~~用第二个不同架构的小 GGUF 做替换验证：同一套 CLI/server，只换 manifest。~~ 已做：`examples/models/smollm2-135m/`（llama + GPT-2 BPE + NORM RoPE，无 QKV bias）。
-4. ~~数值级与 llama.cpp 对齐、logits 加速~~ 已做：greedy n=4 锁进 `scripts/verify.locks`；量化 fused / Q8 点积；KV 按请求扩窗；top_p。
+4. ~~数值级与 llama.cpp 对齐、logits 加速~~ 已做：greedy n=4 按包锁进 `verify.lock`；量化 fused / Q8 点积；KV 按请求扩窗；top_p。
 5. ~~**Phase 3.1** 公平 CPU 测速~~ 已做：`scripts/bench_cpu.sh`；decode 1.16× llama CPU，prefill 0.49×。
 6. ~~**Phase 3.2** kernel 到 0.6×~~ 停手：decode 已过线，不再开 kernel 项。
 7. **Phase 3.3**：树莓派 NEON / 不 OOM / mmap。不设相对 llama 的 tok/s 线。桌面入口 `scripts/verify_arm.sh`；实机 greedy 锁点仍待跑。
@@ -411,12 +411,13 @@ bash scripts/verify_arm.sh
 | 入口 | 用途 |
 | --- | --- |
 | `bash scripts/verify_mvp.sh` | 日常 / CI：只测 native CPU fallback，不 shell-out llama.cpp |
-| `scripts/verify.locks` | Qwen / SmolLM 的 prompt id 与 greedy n=4 |
+| `scripts/verify.locks` | 共享 dump prompt 与 greedy n |
+| `examples/models/<pack>/verify.lock` | 该包 tokenize / greedy id；缺 GGUF 则跳过 |
 | `bash scripts/align_llama.sh` | 可选对照 llama.cpp 数值（`--no-conversation` / greedy id） |
 | `bash scripts/bench_cpu.sh` | 可选公平 CPU 速度对照（n=32，llama `-ngl 0` + 隐藏 GPU） |
 | `bash scripts/verify_arm.sh` | Phase 3.3：aarch64 NEON 构建；x86 上 qemu unit，实机跑 greedy 锁点 |
 
-改锁点只改 `verify.locks`。速度达标线不进 CI，避免 GPU llama 或短序列噪声误杀。
+改数值锁点改对应包的 `verify.lock`。速度达标线不进 CI，避免 GPU llama 或短序列噪声误杀。
 
 ## 追溯规则
 

@@ -712,6 +712,7 @@ void edgexpu_native_free(edgexpu_native_session *session) {
     edgexpu_tokenizer_free(&session->tokenizer);
     edgexpu_kv_cache_free(&session->kv);
     native_unmap(session);
+    edgexpu_gguf_info_free(&session->gguf);
     memset(session, 0, sizeof(*session));
     session->file_fd = -1;
 }

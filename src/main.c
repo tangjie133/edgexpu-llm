@@ -21,12 +21,12 @@ static void print_usage(void) {
     printf("Usage:\n");
     printf("  edgexpu capabilities\n");
     printf("  edgexpu inspect-manifest <manifest.json>\n");
-    printf("  edgexpu generate <manifest.json> <prompt> [max_tokens]\n");
-    printf("  edgexpu benchmark <manifest.json> <prompt> [max_tokens]\n");
-    printf("  edgexpu compare <manifest.json> <prompt>\n");
-    printf("  edgexpu trace <manifest.json> <prompt>\n");
+    printf("  edgexpu generate <manifest.json|model.gguf> <prompt> [max_tokens]\n");
+    printf("  edgexpu benchmark <manifest.json|model.gguf> <prompt> [max_tokens]\n");
+    printf("  edgexpu compare <manifest.json|model.gguf> <prompt>\n");
+    printf("  edgexpu trace <manifest.json|model.gguf> <prompt>\n");
     printf("  edgexpu inspect-gguf <model.gguf>\n");
-    printf("  edgexpu tokenize <manifest.json> <text>\n");
+    printf("  edgexpu tokenize <manifest.json|model.gguf> <text>\n");
     printf("  edgexpu dump-logits <manifest.json|model.gguf> <prompt> [n]\n");
     printf("  edgexpu executor-selftest\n");
     printf("  edgexpu scheduler-selftest\n");
@@ -737,62 +737,106 @@ static int command_scheduler_selftest(void) {
 }
 
 static int command_inspect_gguf(const char *gguf_path) {
-    edgexpu_native_session session;
+    edgexpu_gguf_info info;
+    edgexpu_tokenizer tokenizer;
+    edgexpu_arch_adapter adapter;
     char error[256] = {0};
 
-    edgexpu_native_init(&session);
-    if (!edgexpu_native_load(&session, gguf_path, error, sizeof(error))) {
+    memset(&info, 0, sizeof(info));
+    edgexpu_tokenizer_init(&tokenizer);
+    if (!edgexpu_gguf_load(gguf_path, &info, &tokenizer, error, sizeof(error))) {
         fprintf(stderr, "GGUF 加载失败：%s\n", error);
-        edgexpu_native_free(&session);
+        edgexpu_gguf_info_free(&info);
+        edgexpu_tokenizer_free(&tokenizer);
         return 1;
     }
-    edgexpu_native_print_info(&session);
-    edgexpu_native_free(&session);
+
+    printf("architecture=%s\n", info.architecture);
+    printf("name=%s\n", info.name);
+    printf("file_size=%llu\n", (unsigned long long)info.file_size);
+    printf("block_count=%u\n", info.block_count);
+    printf("context_length=%u\n", info.context_length);
+    printf("embedding_length=%u\n", info.embedding_length);
+    printf("feed_forward_length=%u\n", info.feed_forward_length);
+    printf("head_count=%u\n", info.head_count);
+    printf("head_count_kv=%u\n", info.head_count_kv);
+    printf("head_dim=%d\n", edgexpu_gguf_head_dim(&info));
+    printf("tensor_count=%llu\n", (unsigned long long)info.tensor_count);
+    printf("tokenizer_model=%s\n", info.tokenizer_model);
+    printf("tokenizer_pre=%s\n", info.tokenizer_pre);
+    printf("vocab_size=%u\n", tokenizer.vocab_size);
+    printf("n_merges=%u\n", tokenizer.n_merges);
+    printf("eos=%u pad=%u\n", info.eos_token_id, info.pad_token_id);
+
+    if (!edgexpu_arch_from_gguf(&info, &adapter, error, sizeof(error))) {
+        printf("native_adapter=unsupported\n");
+        printf("native_adapter_error=%s\n", error);
+        edgexpu_gguf_info_free(&info);
+        edgexpu_tokenizer_free(&tokenizer);
+        return 0;
+    }
+    printf("adapter=%s qkv_bias=%d rope=%s ffn=%s tokenizer=%s\n",
+           adapter.name,
+           adapter.has_qkv_bias,
+           edgexpu_rope_type_name(adapter.rope),
+           edgexpu_ffn_type_name(adapter.ffn),
+           edgexpu_tokenizer_kind_name(adapter.tokenizer));
+    edgexpu_gguf_info_free(&info);
+    edgexpu_tokenizer_free(&tokenizer);
     return 0;
 }
 
 /* 对原文 encode/decode，不套 chat template，便于核对 vocab。 */
-static int command_tokenize(const char *manifest_path, const char *text) {
+static int command_tokenize(const char *path, const char *text) {
     edgexpu_model_manifest manifest;
-    edgexpu_native_session session;
+    edgexpu_gguf_info info;
+    edgexpu_tokenizer tokenizer;
     char error[256] = {0};
     char decoded[EDGEXPU_TEXT_LARGE];
+    const char *gguf_path = path;
+    const char *model_id = "";
+    uint32_t ids[4096];
+    int id_count = 0;
     int i;
 
-    if (!edgexpu_manifest_load(manifest_path, &manifest, error, sizeof(error))) {
-        fprintf(stderr, "manifest 读取失败：%s\n", error);
-        return 1;
+    memset(&info, 0, sizeof(info));
+    edgexpu_tokenizer_init(&tokenizer);
+    if (!edgexpu_path_is_gguf(path)) {
+        if (!edgexpu_manifest_load(path, &manifest, error, sizeof(error))) {
+            fprintf(stderr, "manifest 读取失败：%s\n", error);
+            return 1;
+        }
+        gguf_path = manifest.primary_artifact.path;
+        model_id = manifest.model_id;
+    } else {
+        model_id = path;
     }
 
-    edgexpu_native_init(&session);
-    if (!edgexpu_native_load(&session, manifest.primary_artifact.path, error, sizeof(error))) {
-        fprintf(stderr, "native tokenizer 加载失败：%s\n", error);
-        edgexpu_native_free(&session);
+    if (!edgexpu_gguf_load(gguf_path, &info, &tokenizer, error, sizeof(error))) {
+        fprintf(stderr, "tokenizer 加载失败：%s\n", error);
+        edgexpu_gguf_info_free(&info);
+        edgexpu_tokenizer_free(&tokenizer);
         return 1;
     }
-    if (!edgexpu_native_tokenize(&session, text, error, sizeof(error))) {
+    if (!edgexpu_tokenizer_encode(&tokenizer, text, ids, 4096, &id_count, error, sizeof(error))) {
         fprintf(stderr, "tokenize 失败：%s\n", error);
-        edgexpu_native_free(&session);
+        edgexpu_gguf_info_free(&info);
+        edgexpu_tokenizer_free(&tokenizer);
         return 1;
     }
 
-    printf("model_id=%s\n", manifest.model_id);
-    printf("vocab_size=%u\n", session.tokenizer.vocab_size);
-    printf("token_count=%d\n", session.token_count);
+    printf("model_id=%s\n", model_id);
+    printf("vocab_size=%u\n", tokenizer.vocab_size);
+    printf("token_count=%d\n", id_count);
     printf("token_ids=");
-    for (i = 0; i < session.token_count; i++) {
-        printf("%s%u", i == 0 ? "" : ",", session.token_ids[i]);
+    for (i = 0; i < id_count; i++) {
+        printf("%s%u", i == 0 ? "" : ",", ids[i]);
     }
     printf("\n");
-    edgexpu_tokenizer_decode(
-        &session.tokenizer,
-        session.token_ids,
-        session.token_count,
-        decoded,
-        sizeof(decoded)
-    );
+    edgexpu_tokenizer_decode(&tokenizer, ids, id_count, decoded, sizeof(decoded));
     printf("decoded=%s\n", decoded);
-    edgexpu_native_free(&session);
+    edgexpu_gguf_info_free(&info);
+    edgexpu_tokenizer_free(&tokenizer);
     return 0;
 }
 

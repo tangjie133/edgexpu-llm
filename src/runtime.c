@@ -758,7 +758,11 @@ int edgexpu_runtime_load_model(
         return 0;
     }
 
-    if (!edgexpu_manifest_load(manifest_path, &runtime->manifest, error, error_size)) {
+    if (edgexpu_path_is_gguf(manifest_path)) {
+        if (!edgexpu_manifest_from_gguf(manifest_path, &runtime->manifest, error, error_size)) {
+            return 0;
+        }
+    } else if (!edgexpu_manifest_load(manifest_path, &runtime->manifest, error, error_size)) {
         return 0;
     }
 

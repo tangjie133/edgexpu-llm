@@ -5,16 +5,30 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=verify.locks
-source "${ROOT_DIR}/scripts/verify.locks"
+# shellcheck source=verify.common.sh
+source "${ROOT_DIR}/scripts/verify.common.sh"
 
 BIN="${ROOT_DIR}/build/edgexpu"
-GGUF="${1:-${ROOT_DIR}/examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf}"
+DEFAULT_GGUF=""
+for candidate in \
+    "${ROOT_DIR}/examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
+    "${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+do
+    if [[ -f "${candidate}" ]]; then
+        DEFAULT_GGUF="${candidate}"
+        break
+    fi
+done
+GGUF="${1:-${DEFAULT_GGUF}}"
 PROMPT="${2:-${PROMPT}}"
 N="${3:-${GREEDY_N}}"
 LLAMA_BIN_DIR="${LLAMA_BIN_DIR:-/home/tj/Desktop/llama.cpp/build/bin}"
 export LD_LIBRARY_PATH="${LLAMA_BIN_DIR}:${LD_LIBRARY_PATH:-}"
 
+if [[ -z "${GGUF}" || ! -f "${GGUF}" ]]; then
+    echo "missing GGUF; pass a path or place a native pack under examples/models/" >&2
+    exit 1
+fi
 if [[ ! -x "${BIN}" ]]; then
     echo "missing ${BIN}; build first" >&2
     exit 1
@@ -28,25 +42,15 @@ EDGE_GREEDY="$(printf '%s\n' "${DUMP}" | sed -n 's/^greedy_ids=//p')"
 EDGE_GREEDY_TEXT="$(printf '%s\n' "${DUMP}" | sed -n 's/^greedy_text=//p')"
 
 if [[ "${N}" == "${GREEDY_N}" ]]; then
-    expected_prompt=""
-    expected_greedy=""
-    case "${GGUF}" in
-        *qwen2.5-0.5b*)
-            expected_prompt="${QWEN_PROMPT_IDS}"
-            expected_greedy="${QWEN_GREEDY_IDS}"
-            ;;
-        *smollm2-135m*|*SmolLM2*)
-            expected_prompt="${SMOL_PROMPT_IDS}"
-            expected_greedy="${SMOL_GREEDY_IDS}"
-            ;;
-    esac
-    if [[ -n "${expected_greedy}" ]]; then
-        echo "lock token_ids=${expected_prompt} greedy_ids=${expected_greedy}"
-        if [[ "${EDGE_IDS}" != "${expected_prompt}" || "${EDGE_GREEDY}" != "${expected_greedy}" ]]; then
+    if match_pack_by_gguf "${GGUF}" && [[ "${NATIVE}" == "1" && -n "${GREEDY_IDS}" ]]; then
+        echo "lock pack=${PACK_NAME} token_ids=${PROMPT_IDS} greedy_ids=${GREEDY_IDS}"
+        if [[ "${EDGE_IDS}" != "${PROMPT_IDS}" || "${EDGE_GREEDY}" != "${GREEDY_IDS}" ]]; then
             echo "lock MISMATCH edge_ids=${EDGE_IDS} edge_greedy=${EDGE_GREEDY}" >&2
             exit 1
         fi
         echo "lock: MATCH"
+    else
+        echo "lock: no native verify.lock for this GGUF (skip id check)"
     fi
 fi
 

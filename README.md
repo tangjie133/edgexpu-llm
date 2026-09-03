@@ -251,7 +251,7 @@ cmake --build build --config Release
 bash scripts/verify_mvp.sh
 ```
 
-日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。数值锁在 `scripts/verify.locks`。
+日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。缺 GGUF 的包会跳过，不把 CI 钉死在某一个文件名上。
 
 llama.cpp 只是可选对照，不进默认验证：
 

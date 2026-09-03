@@ -1,0 +1,6 @@
+# Native greedy n=4 for this pack only. Missing GGUF → verify_mvp.sh skips the pack.
+ADAPTER=qwen2
+NATIVE=1
+PROMPT_IDS=9707,10349,55,6325
+GREEDY_IDS=271,2,10349,55
+MANIFEST_CONTAINS='name: Qwen2.5-Coder-0.5B-Instruct'

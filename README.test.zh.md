@@ -8,14 +8,60 @@
 | 第 2 轮 | 2026-09-03 ~10:00 | P1 修补回归 + ARM qemu greedy 锁点 |
 | 第 3 轮 | 2026-09-03 ~10:15 | 第 2 轮 P2 修补回归 |
 | 第 4 轮 | 2026-09-03 ~10:50 | 树莓派 4 实机；发现 generate 依赖 llama（P0） |
-| **第 5 轮（本次）** | **2026-09-03 ~11:10** | **P0 修复后：桌面无 llama PATH + 树莓派产品入口** |
+| 第 5 轮 | 2026-09-03 ~11:10 | P0 修复后：桌面无 llama PATH + 树莓派产品入口 |
+| **第 6 轮（本次）** | **2026-09-03 ~11:30** | **v0.0.7：native 成功不再探测 llama；NEON Q4_K；qemu 自动 emulated** |
 
 测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
-测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM，根分区 `mmcblk0p2` ext4。仓库 `/home/a/Desktop/edgexpu-llm`（`2f50a1c`）。板上 **无** llama-cli。本轮只记录，不改代码。
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM，根分区 `mmcblk0p2` ext4。仓库 `/home/a/Desktop/edgexpu-llm`（`feb32ac` v0.0.7）。板上 **无** llama-cli。本轮只记录，不改产品代码。
 
 ---
 
-## 0. 第 5 轮结论（P0 回归）
+## 0. 第 6 轮结论（v0.0.7）
+
+对照第 5 轮剩余项：native 成功后 **不再** 调用 llama `backend->load()`，改为 `edgexpu_backend_cpu_baseline_bind()` 后直接返回。`verify_mvp.sh` 已锁「空 PATH generate」。板上空 PATH `generate` 仍出 `4` / `cpu.native`。
+
+同提交还带了两处非 P0：ARM `Q4_K×Q8_K` NEON 点积；qemu-user 靠 `/proc/cpuinfo` `CPU implementer == 0x00` 自动标 `emulated=true`（不必再设 `EDGEXPU_EMULATED`）。
+
+| 项 | 第 5 轮 | 第 6 轮 |
+| --- | --- | --- |
+| 提交 | `2f50a1c` v0.0.6 | **`feb32ac` v0.0.7** |
+| 桌面 `verify_mvp.sh` | 通过 | **通过**（11:22，当时 0.5B GGUF 仍在；含空 PATH generate） |
+| native 成功后是否探测 llama | 会 `backend->load()`（失败忽略） | **否**，`bind()` 后 `return 1` |
+| 板上空 PATH `generate` 2+2 | 有 llama 探测但失败被忽略 | **通过** `4` / `stop` / `cpu.native` / ptok=21（PATH 仅空目录） |
+| 板上 greedy 锁点 | MATCH | **MATCH**（重建后） |
+| 板上 `benchmark` n=32 | decode 8.94 / prefill 16.67 | decode **8.61** / prefill **16.09** / mem **385MB**（同量级，NEON Q4_K **未带来可测加速**） |
+| 板上 HTTP 2+2 | `"4"` / `stop` | **通过** `"4"` / `stop` |
+| qemu 裸跑 `emulated` | `false`（除非脚本注入） | **`true`**（implementer `0x00`） |
+| 桌面 Qwen 参考包 | 0.5B Q4_K_M 在位 | **本轮中途被换成正在下载的 `Qwen3.5-4B-Q8_0.gguf`**，manifest 仍指向旧文件名；之后桌面 Qwen 锁点 / `EDGEXPU_ARM_FULL` **无法复跑** |
+
+板上 capabilities：`arch=aarch64` `cpu_count=4` `memory_total_mb=3796` `simd=neon` `emulated=false` `cpu_baseline=false`。n=32 后 available 仍约 3.3Gi，swap 未用。
+
+### 第 6 轮已关闭
+
+1. **native 成功仍探测 llama。** 已关。产品路径不再要求 PATH 上有 `llama-cli`。
+2. **裸 qemu 默认 `emulated=false`。** 已关（aarch64 qemu-user）。实机 implementer 非 0 仍为 `false`。
+
+### 第 6 轮环境问题（不是 runtime 回归）
+
+本轮 11:25 起，桌面 `examples/models/qwen2.5-0.5b/` 里的 `qwen2.5-0.5b-instruct-q4_k_m.gguf` 消失，同目录出现体积持续增大的 `Qwen3.5-4B-Q8_0.gguf`（11:31 已约 3.8G）。manifest 仍写 0.5B 文件名与 `cpu.native`。因此：
+
+- 11:22 的 `verify_mvp.sh` 绿是有效结果；**现在再跑会因缺 0.5B 文件失败**。
+- `EDGEXPU_ARM_FULL=1` 报 `missing …qwen2.5-0.5b-instruct-q4_k_m.gguf`。ARM qemu **unit** 仍绿；Qwen greedy 锁点改在 **Pi 本机** 复测并通过。
+- 未完成的 Qwen3.5 文件 `inspect-gguf` 为 `GGUF tokenizer tokens 读取失败`。计划已写明换 Qwen3 需要新 adapter，**不要**把这个文件当 0.5B 参考包验收。
+
+建议：4B 权重量放到独立目录；把 0.5B GGUF 放回原文件名，否则桌面 CI 会红。板上 0.5B 包完好。
+
+### 第 6 轮仍存在
+
+1. **Pi 上 NEON Q4_K 无明显 tok/s 收益。** greedy 锁点绿，说明数值没漂；decode 8.61 vs 第 5 轮 8.94，属噪声。若目标是加速，需要另测热点（不一定是这条 dot）。
+2. **桌面 Qwen 参考包被换走**（见上）。SmolLM GGUF 仍在，空 PATH generate 走 `cpu.native`（2+2 被 n=16 截成半句，属 135M 质量，不是 P0）。
+3. 板上仍无 SmolLM GGUF。NPU / Windows / soak 未测。
+4. executor / HTTP 仍单线程；0.5B 幻觉 NVIDIA；无 seed / stop / 真 JSON parser。
+
+---
+
+## 0a. 第 5 轮结论（P0 回归，归档）
+
 
 第 4 轮 P0 **已关闭**。GGUF load 先 `native_load`，native 成功则不再要求 llama。桌面把 PATH 去掉 `/usr/local/bin`（llama-cli 所在）后 `generate` 仍出 `4`。板上无 llama，`generate` / `benchmark` / `serve` 全部可用，`backend=cpu.native`。
 
@@ -32,7 +78,7 @@
 
 板上 n=32 文本与桌面同方向（含 NVIDIA 幻觉），属 Coder 0.5B，不是回归。tok/s 只作 telemetry，**无相对 llama 达标线**（板上也没有 llama）。
 
-剩余：SmolLM GGUF 仍不在板上；NPU / Windows / soak 未测。load 仍会调用一次 llama `backend->load()`（失败被忽略），不影响产品路径。
+当时剩余：SmolLM GGUF 仍不在板上；NPU / Windows / soak 未测。load 仍会调用一次 llama `backend->load()`（失败被忽略）。**第 6 轮已去掉这次探测。**
 
 ---
 
@@ -146,12 +192,12 @@ edgexpu generate … 中文一句话 n=32
 ### 3.2 ARM / qemu
 
 ```text
-qemu 无 EDGEXPU_EMULATED   → emulated=false（仍报宿主机 24 核 / 125GiB）
+qemu 无 EDGEXPU_EMULATED   → 第 3 轮为 emulated=false；第 6 轮起为 true（implementer 0x00）
 qemu + EDGEXPU_EMULATED=1 → emulated=true, simd=neon, arch=aarch64
-verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿
+verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿（需 0.5B GGUF）
 ```
 
-**注意：** 忘记设 `EDGEXPU_EMULATED=1` 时，qemu 二进制看起来像一台 24 核 aarch64 工作站。官方脚本不会踩这个坑；手工 qemu 会。
+**注意：** 第 3 轮时忘记设 `EDGEXPU_EMULATED=1`，qemu 二进制看起来像一台 24 核 aarch64 工作站。第 6 轮起 `emulated` 会自动为 true；核数/内存仍是宿主机值。
 
 ### 3.3 HTTP
 
@@ -171,20 +217,21 @@ verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿
 
 ## 4. 第 3 轮仍存在的问题
 
-1. **裸 qemu 默认 `emulated=false`。** 只有脚本注入环境变量。可考虑在 aarch64 交叉二进制上探测 qemu（`/proc` 或 `AT_EXECFN`），避免手工漏设。
+1. **裸 qemu 默认 `emulated=false`。** 第 6 轮已关：qemu-user aarch64 自动 `emulated=true`。
 2. **executor / HTTP 仍单线程。** MVP 已知限制。
 3. **0.5B 不听 system**（第 2 轮 BANANA）。模板已套上。
 4. **生成仍幻觉 NVIDIA**（Coder 0.5B）。身份已写进 manifest，不要当 Instruct 通用助手验收。
 5. **无 seed / stop / 真 JSON parser。**
-6. **NPU、Windows、soak 未测。** 树莓派见第 5 轮：P0 已关，产品入口可用。
+6. **NPU、Windows、soak 未测。** 树莓派见第 5–6 轮：产品入口可用；第 6 轮不再探测 llama。
 
 ---
 
 ## 5. 建议
 
-1. 第 5 轮已关 P0。板上 tok/s 仅记录（decode 8.94）；不要拿它和桌面 55 tok/s 或 llama 比达标。
-2. 手工 qemu 请始终 `EDGEXPU_EMULATED=1`。
+1. 第 5–6 轮已关 P0。板上 tok/s 仅记录（第 6 轮 decode 8.61）；不要拿它和桌面 55 tok/s 或 llama 比达标。
+2. qemu-user 现在会自动标 `emulated=true`；`verify_arm.sh` 仍会设 `EDGEXPU_EMULATED=1`。
 3. 不要把第 3 轮桌面满载 9–20 tok/s 写进计划当回归。
+4. 不要把非 0.5B 权重下载进 `examples/models/qwen2.5-0.5b/`，桌面 `verify_mvp.sh` 认的是旧文件名。
 
 ---
 

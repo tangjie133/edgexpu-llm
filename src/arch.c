@@ -60,6 +60,16 @@ int edgexpu_arch_from_gguf(
         return select_tokenizer(info, adapter, error, error_size);
     }
 
+    if (arch_is(name, "qwen35") || arch_is(name, "qwen3.5")) {
+        snprintf(
+            error,
+            error_size,
+            "architecture=%s 是 Attention+SSM 混合结构，当前 cpu.native 尚未实现该 adapter",
+            name
+        );
+        return 0;
+    }
+
     if (arch_is(name, "llama") || arch_is(name, "mistral")) {
         snprintf(adapter->name, sizeof(adapter->name), "%s", name);
         adapter->has_qkv_bias = 0;

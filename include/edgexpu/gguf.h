@@ -13,9 +13,9 @@ extern "C" {
 
 /* 有限 GGUF v3 loader：读 metadata、tensor 目录和 GPT-2 tokenizer。
  * 不解析全部 KV；权重本体由 native 路径 mmap 后再按 tensor 反量化。
+ * tensor 表按文件中的 tensor_count 分配，不写死模型层数。
  */
 
-#define EDGEXPU_GGUF_MAX_TENSORS 512
 #define EDGEXPU_GGUF_TENSOR_NAME 96
 
 typedef struct edgexpu_gguf_tensor {
@@ -52,10 +52,12 @@ typedef struct edgexpu_gguf_info {
     uint64_t data_offset;
     uint64_t file_size;
     uint32_t n_tensors;
-    edgexpu_gguf_tensor tensors[EDGEXPU_GGUF_MAX_TENSORS];
+    uint32_t tensors_cap;
+    edgexpu_gguf_tensor *tensors;
 } edgexpu_gguf_info;
 
 void edgexpu_gguf_info_init(edgexpu_gguf_info *info);
+void edgexpu_gguf_info_free(edgexpu_gguf_info *info);
 
 /* 打开 GGUF，填充 info；tokenizer 非空时同时加载 tokens/merges。 */
 int edgexpu_gguf_load(

@@ -1,13 +1,13 @@
 #include "edgexpu/tokenizer.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* GPT-2 BPE：bytes-to-unicode + merge 表。特殊 token 以 `<...>` 整段匹配 vocab。 */
 
 #define EDGEXPU_BPE_MAX_PIECES 256
-#define EDGEXPU_MERGE_BLOB_CAP (12u * 1024u * 1024u)
 
 static uint16_t gpt2_byte_to_cp[256];
 static int16_t gpt2_cp_to_byte[512];
@@ -204,31 +204,101 @@ int edgexpu_tokenizer_prepare(edgexpu_tokenizer *tokenizer, char *error, size_t 
     }
 
     edgexpu_tokenizer_free(tokenizer);
-    tokenizer->blob = (char *)malloc(EDGEXPU_TOKENIZER_BLOB_CAP);
-    tokenizer->offsets = (uint32_t *)calloc(EDGEXPU_TOKENIZER_MAX_VOCAB, sizeof(uint32_t));
-    tokenizer->merge_blob = (char *)malloc(EDGEXPU_MERGE_BLOB_CAP);
-    tokenizer->merge_line_offsets = (uint32_t *)calloc(EDGEXPU_TOKENIZER_MAX_MERGES, sizeof(uint32_t));
-    if (tokenizer->blob == NULL || tokenizer->offsets == NULL ||
-        tokenizer->merge_blob == NULL || tokenizer->merge_line_offsets == NULL) {
-        edgexpu_tokenizer_free(tokenizer);
-        set_error(error, error_size, "tokenizer 缓冲区分配失败");
+    return 1;
+}
+
+static uint32_t tokenizer_next_pow2(uint32_t n) {
+    uint32_t p = 1;
+    if (n <= 1) {
+        return 1;
+    }
+    while (p < n) {
+        if (p > (UINT32_MAX >> 1)) {
+            return UINT32_MAX;
+        }
+        p <<= 1;
+    }
+    return p;
+}
+
+static int tokenizer_grow_blob(char **blob, size_t *cap, size_t need) {
+    size_t next = *cap;
+    char *grown;
+
+    if (need <= *cap) {
+        return 1;
+    }
+    next = next == 0 ? 4096 : next;
+    while (next < need) {
+        if (next > (SIZE_MAX / 2)) {
+            return 0;
+        }
+        next *= 2;
+    }
+    grown = (char *)realloc(*blob, next);
+    if (grown == NULL) {
         return 0;
     }
-    tokenizer->blob_used = 0;
-    tokenizer->merge_blob_used = 0;
-    tokenizer->vocab_size = 0;
-    tokenizer->n_merges = 0;
+    *blob = grown;
+    *cap = next;
+    return 1;
+}
+
+int edgexpu_tokenizer_reserve(
+    edgexpu_tokenizer *tokenizer,
+    uint32_t vocab,
+    uint32_t merges,
+    char *error,
+    size_t error_size
+) {
+    if (tokenizer == NULL) {
+        set_error(error, error_size, "tokenizer 为空");
+        return 0;
+    }
+    if (vocab > tokenizer->vocab_cap) {
+        uint32_t *offsets = (uint32_t *)realloc(tokenizer->offsets, (size_t)vocab * sizeof(uint32_t));
+        if (offsets == NULL) {
+            set_error(error, error_size, "tokenizer vocab 表分配失败");
+            return 0;
+        }
+        memset(offsets + tokenizer->vocab_cap, 0, (size_t)(vocab - tokenizer->vocab_cap) * sizeof(uint32_t));
+        tokenizer->offsets = offsets;
+        tokenizer->vocab_cap = vocab;
+    }
+    if (merges > tokenizer->merge_cap) {
+        uint32_t *lines = (uint32_t *)realloc(
+            tokenizer->merge_line_offsets,
+            (size_t)merges * sizeof(uint32_t)
+        );
+        if (lines == NULL) {
+            set_error(error, error_size, "tokenizer merge 表分配失败");
+            return 0;
+        }
+        memset(
+            lines + tokenizer->merge_cap,
+            0,
+            (size_t)(merges - tokenizer->merge_cap) * sizeof(uint32_t)
+        );
+        tokenizer->merge_line_offsets = lines;
+        tokenizer->merge_cap = merges;
+    }
     return 1;
 }
 
 int edgexpu_tokenizer_append_piece(edgexpu_tokenizer *tokenizer, const char *piece, size_t len) {
-    if (tokenizer == NULL || tokenizer->blob == NULL || piece == NULL) {
+    if (tokenizer == NULL || piece == NULL) {
         return 0;
     }
-    if (tokenizer->vocab_size >= EDGEXPU_TOKENIZER_MAX_VOCAB) {
-        return 0;
+    if (tokenizer->vocab_size >= tokenizer->vocab_cap) {
+        uint32_t next = tokenizer->vocab_cap == 0 ? 256 : tokenizer->vocab_cap * 2;
+        if (next <= tokenizer->vocab_size) {
+            next = tokenizer->vocab_size + 1;
+        }
+        if (!edgexpu_tokenizer_reserve(tokenizer, next, tokenizer->merge_cap, NULL, 0)) {
+            return 0;
+        }
     }
-    if (tokenizer->blob_used + len + 1 > EDGEXPU_TOKENIZER_BLOB_CAP) {
+    if (!tokenizer_grow_blob(&tokenizer->blob, &tokenizer->blob_cap, tokenizer->blob_used + len + 1)) {
         return 0;
     }
     tokenizer->offsets[tokenizer->vocab_size] = (uint32_t)tokenizer->blob_used;
@@ -240,13 +310,22 @@ int edgexpu_tokenizer_append_piece(edgexpu_tokenizer *tokenizer, const char *pie
 }
 
 int edgexpu_tokenizer_append_merge_line(edgexpu_tokenizer *tokenizer, const char *line, size_t len) {
-    if (tokenizer == NULL || tokenizer->merge_blob == NULL || line == NULL) {
+    if (tokenizer == NULL || line == NULL) {
         return 0;
     }
-    if (tokenizer->n_merges >= EDGEXPU_TOKENIZER_MAX_MERGES) {
-        return 0;
+    if (tokenizer->n_merges >= tokenizer->merge_cap) {
+        uint32_t next = tokenizer->merge_cap == 0 ? 256 : tokenizer->merge_cap * 2;
+        if (next <= tokenizer->n_merges) {
+            next = tokenizer->n_merges + 1;
+        }
+        if (!edgexpu_tokenizer_reserve(tokenizer, tokenizer->vocab_cap, next, NULL, 0)) {
+            return 0;
+        }
     }
-    if (tokenizer->merge_blob_used + len + 1 > EDGEXPU_MERGE_BLOB_CAP) {
+    if (!tokenizer_grow_blob(
+            &tokenizer->merge_blob,
+            &tokenizer->merge_blob_cap,
+            tokenizer->merge_blob_used + len + 1)) {
         return 0;
     }
     tokenizer->merge_line_offsets[tokenizer->n_merges] = (uint32_t)tokenizer->merge_blob_used;
@@ -279,8 +358,8 @@ static int vocab_lookup(
     }
 
     hash = hash_bytes(piece, len);
-    for (i = 0; i < EDGEXPU_TOKENIZER_HASH_CAP; i++) {
-        slot = (hash + i) & (EDGEXPU_TOKENIZER_HASH_CAP - 1);
+    for (i = 0; i < tokenizer->hash_cap; i++) {
+        slot = (hash + i) & (tokenizer->hash_cap - 1);
         if (tokenizer->vocab_hash[slot] == 0xFFFFFFFFu) {
             return 0;
         }
@@ -340,8 +419,8 @@ static int pair_lookup(
         return 0;
     }
 
-    for (i = 0; i < EDGEXPU_TOKENIZER_HASH_CAP; i++) {
-        slot = (hash + i) & (EDGEXPU_TOKENIZER_HASH_CAP - 1);
+    for (i = 0; i < tokenizer->hash_cap; i++) {
+        slot = (hash + i) & (tokenizer->hash_cap - 1);
         if (!tokenizer->pair_hash_used[slot]) {
             return 0;
         }
@@ -368,27 +447,37 @@ int edgexpu_tokenizer_build_index(edgexpu_tokenizer *tokenizer, char *error, siz
         return 0;
     }
 
-    tokenizer->vocab_hash = (uint32_t *)malloc(EDGEXPU_TOKENIZER_HASH_CAP * sizeof(uint32_t));
+    {
+        uint32_t need = tokenizer->vocab_size > tokenizer->n_merges
+            ? tokenizer->vocab_size
+            : tokenizer->n_merges;
+        tokenizer->hash_cap = tokenizer_next_pow2(need * 2u);
+        if (tokenizer->hash_cap < 256) {
+            tokenizer->hash_cap = 256;
+        }
+    }
+
+    tokenizer->vocab_hash = (uint32_t *)malloc((size_t)tokenizer->hash_cap * sizeof(uint32_t));
     tokenizer->merge_left = (uint32_t *)calloc(tokenizer->n_merges, sizeof(uint32_t));
     tokenizer->merge_right = (uint32_t *)calloc(tokenizer->n_merges, sizeof(uint32_t));
     tokenizer->merge_result = (uint32_t *)calloc(tokenizer->n_merges, sizeof(uint32_t));
     tokenizer->merge_rank = (uint32_t *)calloc(tokenizer->n_merges, sizeof(uint32_t));
-    tokenizer->pair_hash_left = (uint32_t *)calloc(EDGEXPU_TOKENIZER_HASH_CAP, sizeof(uint32_t));
-    tokenizer->pair_hash_right = (uint32_t *)calloc(EDGEXPU_TOKENIZER_HASH_CAP, sizeof(uint32_t));
-    tokenizer->pair_hash_rank = (uint32_t *)calloc(EDGEXPU_TOKENIZER_HASH_CAP, sizeof(uint32_t));
-    tokenizer->pair_hash_result = (uint32_t *)calloc(EDGEXPU_TOKENIZER_HASH_CAP, sizeof(uint32_t));
-    tokenizer->pair_hash_used = (uint8_t *)calloc(EDGEXPU_TOKENIZER_HASH_CAP, sizeof(uint8_t));
+    tokenizer->pair_hash_left = (uint32_t *)calloc(tokenizer->hash_cap, sizeof(uint32_t));
+    tokenizer->pair_hash_right = (uint32_t *)calloc(tokenizer->hash_cap, sizeof(uint32_t));
+    tokenizer->pair_hash_rank = (uint32_t *)calloc(tokenizer->hash_cap, sizeof(uint32_t));
+    tokenizer->pair_hash_result = (uint32_t *)calloc(tokenizer->hash_cap, sizeof(uint32_t));
+    tokenizer->pair_hash_used = (uint8_t *)calloc(tokenizer->hash_cap, sizeof(uint8_t));
     if (tokenizer->vocab_hash == NULL || tokenizer->pair_hash_used == NULL) {
         set_error(error, error_size, "tokenizer 索引分配失败");
         return 0;
     }
 
-    memset(tokenizer->vocab_hash, 0xFF, EDGEXPU_TOKENIZER_HASH_CAP * sizeof(uint32_t));
+    memset(tokenizer->vocab_hash, 0xFF, (size_t)tokenizer->hash_cap * sizeof(uint32_t));
     for (i = 0; i < tokenizer->vocab_size; i++) {
         const char *piece = edgexpu_tokenizer_piece(tokenizer, i);
         uint32_t hash = hash_bytes(piece, strlen(piece));
-        for (probe = 0; probe < EDGEXPU_TOKENIZER_HASH_CAP; probe++) {
-            slot = (hash + probe) & (EDGEXPU_TOKENIZER_HASH_CAP - 1);
+        for (probe = 0; probe < tokenizer->hash_cap; probe++) {
+            slot = (hash + probe) & (tokenizer->hash_cap - 1);
             if (tokenizer->vocab_hash[slot] == 0xFFFFFFFFu) {
                 tokenizer->vocab_hash[slot] = i;
                 break;
@@ -435,8 +524,8 @@ int edgexpu_tokenizer_build_index(edgexpu_tokenizer *tokenizer, char *error, siz
 
         {
             uint32_t hash = hash_pair(left_id, right_id);
-            for (probe = 0; probe < EDGEXPU_TOKENIZER_HASH_CAP; probe++) {
-                slot = (hash + probe) & (EDGEXPU_TOKENIZER_HASH_CAP - 1);
+            for (probe = 0; probe < tokenizer->hash_cap; probe++) {
+                slot = (hash + probe) & (tokenizer->hash_cap - 1);
                 if (!tokenizer->pair_hash_used[slot]) {
                     tokenizer->pair_hash_used[slot] = 1;
                     tokenizer->pair_hash_left[slot] = left_id;
