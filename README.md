@@ -121,7 +121,10 @@ KV cache 和 memory：
 Flash 和模型驻留：
 
 - 当权重不能轻松全部放进内存时很重要
-- 后续需要支持 prefetch、paging、hot/cold placement
+- native 按层把量化权重拷进固定 staging，`output.weight` 分块算 logits，层后 `madvise(DONTNEED)`
+- 资源预算按工作集（最大一层 + 输出分块 + 短 scratch），不是整份 GGUF `file_size`
+- KV 只给注意力层（`ATTN_SWIGLU` / `ATTN_QK_NORM`）；`GATED_DELTA` 用循环状态
+- `prefetch_weights` 只 hint 下一层，禁止整文件 `WILLNEED`
 
 长期的 internal executor 应该把推理拆成类似这样的 job：
 
@@ -261,7 +264,7 @@ MVP 要保持小而可验证。
 | 目录 | 角色 |
 | --- | --- |
 | `examples/models/smollm2-135m/` | **native 参考包**（adapter=`llama`）。`cpu.native`；greedy n=4 锁在该目录 `verify.lock`。权重 `SmolLM2-135M-Instruct-Q4_K_M.gguf` **不进 git**（`*.gguf` gitignore）。要跑 `generate` / `verify_mvp.sh` / ARM FULL，必须把该文件放到本目录。135M 质量有限，不要用 2+2→4 当能力验收。 |
-| `examples/models/qwen3.5-4b/` | hybrid 示例（adapter=`qwen35`，`NATIVE=1`）。plugin 把层标成 `GATED_DELTA` / `ATTN_QK_NORM`，不在 `native.c` 写死模型。greedy n=4 锁在该目录 `verify.lock`。GGUF context 262144，包内 `context_length=8192` 是边缘调度窗。Pi 4GB 会被资源预算拒绝 mmap。 |
+| `examples/models/qwen3.5-4b/` | hybrid 示例（adapter=`qwen35`，`NATIVE=1`）。plugin 把层标成 `GATED_DELTA` / `ATTN_QK_NORM`，不在 `native.c` 写死模型。greedy n=4 锁在该目录 `verify.lock`。GGUF context 262144，包内 `context_length=8192` 是边缘调度窗。native 按层 staging，预算按工作集而不是 4.2G 整文件；Pi 4GB 在 85% RAM 内可准入。板上仍可能很慢。`verify_mvp.sh` / `verify_arm.sh` 在 `budget_admitted=0` 时 skip 该包，产品包取第一个准入且 selftest 通过的 `NATIVE=1`。 |
 
 加包方式见 `CONTRIBUTING.md`。不要把其它权重塞进已删除的 Qwen2.5-0.5B 目录。
 

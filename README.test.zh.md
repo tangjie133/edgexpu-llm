@@ -19,14 +19,55 @@
 | 第 6 轮 | 2026-09-03 ~11:30 | v0.0.7：native 成功不再探测 llama；NEON Q4_K；qemu 自动 emulated |
 | 第 7 轮 | 2026-09-03 ~13:45 | 架构插件 / backend vtable / 资源预算；Qwen3.5 识别但不做 native |
 | 第 8 轮 | 2026-09-03 ~14:05 | `e135898` 产品路径禁止 llama 后备；0.5B 包删除；4B 归位 |
-| **第 9 轮（本次）** | **2026-09-03 ~14:15** | **`d10a074`：compare 两腿独立已提交；文档写明板上自备 SmolLM GGUF** |
+| 第 9 轮 | 2026-09-03 ~14:15 | `d10a074`：compare 两腿独立已提交；文档写明板上自备 SmolLM GGUF |
+| **第 10 轮（本次）** | **2026-09-03 ~15:30** | **`117db63`：Qwen3.5 hybrid 自研前向（GATED_DELTA / ATTN_QK_NORM）** |
 
 测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
-测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`d10a074`）。板上 **无** llama-cli。本轮只记录，不改产品代码。板上 SmolLM GGUF 仍是第 8 轮拷入的 101MB。
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`117db63`）。板上 **无** llama-cli。本轮只记录，不改产品代码。板上仍有 Qwen3.5-4B Q8_0（4.2G）与 SmolLM2-135M Q4_K_M（101MB）。
 
 ---
 
-## 0. 第 9 轮结论（`d10a074` 第8论测试修改）
+## 0. 第 10 轮结论（`117db63` 第9论修改）
+
+对照第 9 轮剩余项：Qwen3.5 不再是 identify-only。`src/arch/qwen35.c` 设 `native_forward=1`，层类型在 plugin 里选 `GATED_DELTA` / `ATTN_QK_NORM`，`verify.lock` 改为 `NATIVE=1` 并锁 greedy `11,271,40,1044`。产品路径仍是 `cpu.native`，没有走 llama.cpp / Ollama。
+
+| 项 | 第 9 轮 | 第 10 轮 |
+| --- | --- | --- |
+| 提交 | `d10a074` | **`117db63`**（qwen35 native + Gated Delta / QK-norm kernel） |
+| 桌面 `verify_mvp.sh` | 通过（产品包 SmolLM；Qwen3.5 `NATIVE=0`） | **通过**（两包都 `NATIVE=1`；产品包变成 **qwen3.5-4b**，`find \| sort` 排在前面） |
+| Qwen3.5 `inspect-gguf` | `native_adapter=unsupported` / `generate` 失败 | **`adapter=qwen35` `native_forward=1`**；hybrid 层 3×`gated_delta` + 1×`attn_qk_norm` 循环 32 层 |
+| Qwen3.5 dump-logits | 不锁 greedy | **MATCH** `9419,10041,55,6126` / `11,271,40,1044`（`greedy_text=,\n\nI am`） |
+| Qwen3.5 `generate`（空 PATH） | adapter 失败 | **`backend=cpu.native`**，不探测 llama-cli；`What is 2+2?` → 文本 `4`，`finish_reason=stop` |
+| SmolLM dump-logits | MATCH | **仍 MATCH** `19556,24762,72,32736` / `72,60,72,72` |
+| 桌面预算 4B | 只 inspect | **`budget_admitted=1`** `total_mb=4351` `limit_mb=108930` `window=256` |
+| 桌面 ARM qemu unit | 通过 | **通过**（`simd=neon`，`emulated=true`） |
+| `EDGEXPU_ARM_FULL=1` | SmolLM 1 pack | **本轮未跑**：FULL 会在 qemu 里对 4B Q8 dump-logits，成本不合理 |
+| 板上 `inspect-gguf` 4B | `budget_admitted=0` | **仍拒绝**：`4351 MB > 3226 MB`（85% of 3796 MB）；`native_forward=1` 只说明算子在，不改变预算 |
+| 板上 4B `native-selftest` / `generate` | 当时无 native 前向 | **正确失败**：`native budget 4351 MB ... exceeds 3226 MB`，**不是**缺 llama-cli |
+| 板上 SmolLM greedy / generate | MATCH / `cpu.native` | **仍 MATCH**；空 PATH `generate` `backend=cpu.native` |
+| 板上 `verify_mvp.sh` | 通过（当时 Qwen3.5 `NATIVE=0`，不 load 4B） | **红**：第一个 `NATIVE=1` 包就是 4B，`native-selftest` 被预算挡住 |
+| 板上 `verify_arm.sh` | 通过（只锁 SmolLM native） | **红**：aarch64 主机对每个带 GGUF 的 `NATIVE=1` 包做 greedy lock，4B 同样预算失败 |
+
+### 第 9 轮「仍存在」本轮
+
+1. **Qwen3.5 自研 SSM/hybrid 前向：已关（桌面）。** greedy 锁点命中；空 PATH 仍是 `cpu.native`。板上因 RAM 预算不能跑 4B，这是调度拒绝，不是缺 adapter。
+2. NPU / Windows / soak 未测。executor 仍单线程。135M 质量弱，不要用它当能力线。4B 在桌面上 `2+2→4` 只是一条短样本，不是 soak。
+
+### 本轮新问题（自研路径）
+
+1. **P1：板上 CI 与 README 口径不一致。** README 已写「Pi 4GB 会被资源预算拒绝 mmap」，runtime 也确实拒绝。但 `verify_mvp.sh` / `verify_arm.sh` 把「GGUF 在位 + `NATIVE=1`」当成必须 dump-logits / native-selftest。板上留着 4.2G 权重时，**即使 SmolLM 完全绿，官方脚本也红**。这不是要装 llama.cpp，也不是该关 `EDGEXPU_BUDGET_DISABLE=1` 去硬 mmap 4B。
+2. **P2：产品包选择。** `each_pack_dir` 按目录名排序，第一个带 GGUF 的 `NATIVE=1` 包成为 generate / benchmark / HTTP 的产品包。桌面因此用 **4B Q8** 跑 serve，不再用 SmolLM。功能通过，但默认 CI 从 135M 变成 4B。
+
+### 建议（只谈自研 CI / 调度）
+
+1. **预算拒绝应 skip 该包，不要整条 CI 红。** `native-selftest` / `dump-logits` 若报 85% RAM 超限，视为该设备跑不了这个 pack，继续找下一个 `NATIVE=1` 且 `budget_admitted=1` 的包当产品包。板上就能继续用 SmolLM 绿。不要把 llama.cpp 写进这条路径。
+2. **板上要绿的权宜：挪走 4B GGUF。** 缺文件会 skip 该包（现有规则），留下 SmolLM 即可。权重仍可放在板外磁盘，不必删桌面那份。
+3. **不要默认 `EDGEXPU_BUDGET_DISABLE=1`。** 3.7Gi 设备硬跑 4.2G Q8 会把机器打满，不是验证。
+4. `compare` / `align_llama.sh` 维持可选。本轮产品结论不依赖 llama 对照；板上没有 `llama-cli` 仍不是缺陷。
+
+---
+
+## 0a. 第 9 轮结论（`d10a074` 第8论测试修改）
 
 对照第 8 轮剩余项：`compare` 的 llama 腿已与 native load **解耦并进仓库**；`CONTRIBUTING.md` / `verify_mvp.sh` 已写明板上要自备 SmolLM GGUF。产品路径仍只用自研算子。
 

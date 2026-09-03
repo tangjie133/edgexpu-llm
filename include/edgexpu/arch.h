@@ -123,6 +123,8 @@ edgexpu_layer_kind edgexpu_arch_layer_kind(
     int layer_index
 );
 
+int edgexpu_layer_kind_uses_kv(edgexpu_layer_kind kind);
+
 const char *edgexpu_rope_type_name(edgexpu_rope_type rope);
 const char *edgexpu_ffn_type_name(edgexpu_ffn_type ffn);
 const char *edgexpu_tokenizer_kind_name(edgexpu_tokenizer_kind kind);

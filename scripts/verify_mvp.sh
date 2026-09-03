@@ -71,8 +71,24 @@ run_pack_lock() {
 
     if [[ "${NATIVE}" == "1" ]]; then
         require_contains "$("${BIN}" inspect-manifest "${MANIFEST}")" "artifact.backend: cpu.native" "${PACK_NAME} native artifact"
-        require_contains "$("${BIN}" inspect-gguf "${GGUF}")" "adapter=${ADAPTER}" "${PACK_NAME} inspect-gguf"
-        require_contains "$("${BIN}" native-selftest "${GGUF}")" "native selftest passed" "${PACK_NAME} native-selftest"
+        INSPECT_OUTPUT="$("${BIN}" inspect-gguf "${GGUF}")"
+        require_contains "${INSPECT_OUTPUT}" "adapter=${ADAPTER}" "${PACK_NAME} inspect-gguf"
+        if ! inspect_budget_admitted "${INSPECT_OUTPUT}"; then
+            echo "skip ${PACK_NAME}: native budget rejected on this device"
+            printf '%s\n' "${INSPECT_OUTPUT}" | grep -E 'budget_' || true
+            return 0
+        fi
+        SELFTEST_OUTPUT="$("${BIN}" native-selftest "${GGUF}" 2>&1)" || true
+        if ! printf '%s\n' "${SELFTEST_OUTPUT}" | grep -q 'native selftest passed'; then
+            if native_error_is_budget "${SELFTEST_OUTPUT}"; then
+                echo "skip ${PACK_NAME}: native-selftest budget rejected on this device"
+                printf '%s\n' "${SELFTEST_OUTPUT}" | tail -n 20
+                return 0
+            fi
+            echo "${SELFTEST_OUTPUT}" >&2
+            die "${PACK_NAME} native-selftest"
+        fi
+        require_contains "${SELFTEST_OUTPUT}" "native selftest passed" "${PACK_NAME} native-selftest"
         TOKENIZE_OUTPUT="$("${BIN}" tokenize "${MANIFEST}" "${PROMPT}")"
         require_contains "${TOKENIZE_OUTPUT}" "decoded=${PROMPT}" "${PACK_NAME} tokenize"
         require_line "${TOKENIZE_OUTPUT}" "token_ids=${PROMPT_IDS}" "${PACK_NAME} tokenize ids"

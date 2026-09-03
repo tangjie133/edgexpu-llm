@@ -89,6 +89,12 @@ const edgexpu_gguf_tensor *edgexpu_gguf_find_tensor(
     const char *name
 );
 
+/* `blk.%d.` 层号；非 block tensor 返回 -1。 */
+int edgexpu_gguf_tensor_block_index(const char *name);
+
+/* 所有 `blk.{i}.*` 量化字节之和的最大值，供 layer staging 容量。 */
+size_t edgexpu_gguf_max_block_bytes(const edgexpu_gguf_info *info);
+
 #ifdef __cplusplus
 }
 #endif

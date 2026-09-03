@@ -893,6 +893,7 @@ static int command_inspect_gguf(const char *gguf_path) {
             plan.limit_bytes / (1024u * 1024u),
             plan.window
         );
+        printf("budget_reason=%s\n", plan.reason);
     }
 
     if (!edgexpu_arch_from_gguf(&info, &adapter, error, sizeof(error))) {

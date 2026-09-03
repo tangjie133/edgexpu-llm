@@ -286,11 +286,7 @@ static int prefetch_job_callback(
     if (native->file_map == NULL || native->file_map_size == 0) {
         return 1;
     }
-#if defined(POSIX_MADV_WILLNEED)
-    (void)posix_madvise((void *)native->file_map, native->file_map_size, POSIX_MADV_WILLNEED);
-#elif defined(MADV_WILLNEED)
-    (void)madvise((void *)native->file_map, native->file_map_size, MADV_WILLNEED);
-#endif
+    edgexpu_native_prefetch_hint(native);
     return 1;
 }
 
@@ -904,8 +900,7 @@ int edgexpu_runtime_generate_stream(
         snprintf(
             prefetch_detail,
             sizeof(prefetch_detail),
-            "madvise WILLNEED mmap_bytes=%zu (not flash paging)",
-            runtime->native.file_map_size
+            "madvise WILLNEED next-layer hint (not whole mmap)"
         );
         if (!run_scheduled_job_ex(
                 runtime,

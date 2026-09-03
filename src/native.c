@@ -7,6 +7,7 @@
 #include "edgexpu/scheduler.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,6 +175,208 @@ static const uint8_t *tensor_bytes(
         return NULL;
     }
     return session->file_map + offset;
+}
+
+static size_t native_page_size(void) {
+#if defined(_WIN32)
+    return 4096u;
+#else
+    long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (size_t)page : 4096u;
+#endif
+}
+
+static void native_page_advise(const void *ptr, size_t nbytes, int willneed) {
+#if !defined(_WIN32)
+    size_t page;
+    uintptr_t start;
+    uintptr_t end;
+    if (ptr == NULL || nbytes == 0) {
+        return;
+    }
+    page = native_page_size();
+    start = (uintptr_t)ptr & ~(uintptr_t)(page - 1u);
+    end = ((uintptr_t)ptr + nbytes + page - 1u) & ~(uintptr_t)(page - 1u);
+    if (end <= start) {
+        return;
+    }
+    if (willneed) {
+#if defined(POSIX_MADV_WILLNEED)
+        (void)posix_madvise((void *)start, (size_t)(end - start), POSIX_MADV_WILLNEED);
+#elif defined(MADV_WILLNEED)
+        (void)madvise((void *)start, (size_t)(end - start), MADV_WILLNEED);
+#endif
+    } else {
+#if defined(POSIX_MADV_DONTNEED)
+        (void)posix_madvise((void *)start, (size_t)(end - start), POSIX_MADV_DONTNEED);
+#elif defined(MADV_DONTNEED)
+        (void)madvise((void *)start, (size_t)(end - start), MADV_DONTNEED);
+#endif
+    }
+#else
+    (void)ptr;
+    (void)nbytes;
+    (void)willneed;
+#endif
+}
+
+static int native_layer_span(
+    const edgexpu_native_session *session,
+    int layer_index,
+    const uint8_t **start,
+    size_t *nbytes
+) {
+    uint32_t i;
+    uint64_t min_off = UINT64_MAX;
+    uint64_t max_off = 0;
+    if (session == NULL || session->file_map == NULL || layer_index < 0) {
+        return 0;
+    }
+    for (i = 0; i < session->gguf.n_tensors; i++) {
+        const edgexpu_gguf_tensor *tensor = &session->gguf.tensors[i];
+        uint64_t off;
+        size_t n;
+        if (edgexpu_gguf_tensor_block_index(tensor->name) != layer_index) {
+            continue;
+        }
+        off = session->gguf.data_offset + tensor->offset;
+        n = edgexpu_gguf_tensor_nbytes(tensor);
+        if (n == 0 || off >= session->file_map_size) {
+            continue;
+        }
+        if (off < min_off) {
+            min_off = off;
+        }
+        if (off + n > max_off) {
+            max_off = off + n;
+        }
+    }
+    if (min_off == UINT64_MAX || max_off <= min_off) {
+        return 0;
+    }
+    if (max_off > session->file_map_size) {
+        max_off = session->file_map_size;
+    }
+    if (start != NULL) {
+        *start = session->file_map + min_off;
+    }
+    if (nbytes != NULL) {
+        *nbytes = (size_t)(max_off - min_off);
+    }
+    return 1;
+}
+
+static void native_dontneed_layer(const edgexpu_native_session *session, int layer_index) {
+    const uint8_t *start = NULL;
+    size_t nbytes = 0;
+    if (native_layer_span(session, layer_index, &start, &nbytes)) {
+        native_page_advise(start, nbytes, 0);
+    }
+}
+
+static void native_dontneed_tensor(const edgexpu_native_session *session, const edgexpu_gguf_tensor *tensor) {
+    const uint8_t *src = tensor_bytes(session, tensor);
+    size_t n = edgexpu_gguf_tensor_nbytes(tensor);
+    native_page_advise(src, n, 0);
+}
+
+void edgexpu_native_prefetch_hint(edgexpu_native_session *session) {
+    int layer;
+    const uint8_t *start = NULL;
+    size_t nbytes = 0;
+    if (session == NULL || session->file_map == NULL) {
+        return;
+    }
+    layer = session->staged_layer >= 0 ? session->staged_layer + 1 : 0;
+    if (layer >= (int)session->gguf.block_count) {
+        layer = 0;
+    }
+    if (native_layer_span(session, layer, &start, &nbytes)) {
+        native_page_advise(start, nbytes, 1);
+    }
+}
+
+static int native_kv_index(const edgexpu_native_session *session, int layer_index) {
+    if (session == NULL || layer_index < 0) {
+        return -1;
+    }
+    if (session->kv_slot == NULL) {
+        return layer_index;
+    }
+    if ((uint32_t)layer_index >= session->gguf.block_count) {
+        return -1;
+    }
+    return session->kv_slot[layer_index];
+}
+
+static float *native_kv_k_at(edgexpu_native_session *session, int layer_index, int pos) {
+    int slot = native_kv_index(session, layer_index);
+    if (slot < 0) {
+        return NULL;
+    }
+    return edgexpu_kv_cache_k_at(&session->kv, slot, pos);
+}
+
+static float *native_kv_v_at(edgexpu_native_session *session, int layer_index, int pos) {
+    int slot = native_kv_index(session, layer_index);
+    if (slot < 0) {
+        return NULL;
+    }
+    return edgexpu_kv_cache_v_at(&session->kv, slot, pos);
+}
+
+static int ensure_weight_stage(edgexpu_native_session *session, size_t need, char *error, size_t error_size) {
+    uint8_t *grown;
+    if (session == NULL) {
+        set_error(error, error_size, "weight staging session 为空");
+        return 0;
+    }
+    if (need < (size_t)(1u << 20)) {
+        need = (size_t)(1u << 20);
+    }
+    if (session->weight_stage != NULL && session->weight_stage_cap >= need) {
+        return 1;
+    }
+    grown = (uint8_t *)realloc(session->weight_stage, need);
+    if (grown == NULL) {
+        set_error(error, error_size, "weight staging 分配失败");
+        return 0;
+    }
+    session->weight_stage = grown;
+    session->weight_stage_cap = need;
+    return 1;
+}
+
+static const uint8_t *stage_copy_bytes(
+    edgexpu_native_session *session,
+    const uint8_t *src,
+    size_t nbytes,
+    char *error,
+    size_t error_size
+) {
+    size_t aligned;
+    uint8_t *dst;
+    if (src == NULL || nbytes == 0) {
+        set_error(error, error_size, "staging 拷贝参数无效");
+        return NULL;
+    }
+    aligned = (nbytes + 63u) & ~(size_t)63u;
+    if (session->weight_stage == NULL ||
+        session->weight_stage_used + aligned > session->weight_stage_cap) {
+        size_t need = session->weight_stage_used + aligned;
+        if (session->weight_stage_used != 0) {
+            set_error(error, error_size, "weight staging 在层中途不足");
+            return NULL;
+        }
+        if (!ensure_weight_stage(session, need, error, error_size)) {
+            return NULL;
+        }
+    }
+    dst = session->weight_stage + session->weight_stage_used;
+    memcpy(dst, src, nbytes);
+    native_page_advise(src, nbytes, 0);
+    session->weight_stage_used += aligned;
+    return dst;
 }
 
 /* GGUF 未给 freq_base 时：NORM RoPE 用 10000，Neox/Qwen 用 1e6。 */
@@ -365,6 +568,7 @@ static int load_named_weight(
         *dst = NULL;
         return 0;
     }
+    native_dontneed_tensor(session, tensor);
     return 1;
 }
 
@@ -431,7 +635,19 @@ static int load_qweight(
         snprintf(error, error_size, "不支持的量化类型: %s", name);
         return 0;
     }
-    weight->data = src;
+    {
+        size_t nbytes = edgexpu_gguf_tensor_nbytes(tensor);
+        const uint8_t *staged;
+        if (nbytes == 0) {
+            snprintf(error, error_size, "无法计算 tensor 字节数: %s", name);
+            return 0;
+        }
+        staged = stage_copy_bytes(session, src, nbytes, error, error_size);
+        if (staged == NULL) {
+            return 0;
+        }
+        weight->data = staged;
+    }
     weight->type = tensor->type;
     weight->n_out = n_out;
     weight->n_in = n_in;
@@ -670,6 +886,9 @@ static int load_layer_into(
     char name[96];
 
     edgexpu_layer_kind kind;
+    float *saved_conv = NULL;
+    float *saved_ssm = NULL;
+    int had_state = 0;
 
     kind = edgexpu_arch_layer_kind(&session->arch, &session->gguf, layer_index);
     if (kind != EDGEXPU_LAYER_ATTN_SWIGLU &&
@@ -679,7 +898,16 @@ static int load_layer_into(
         return 0;
     }
 
+    if (layer->conv_state != NULL || layer->ssm_state != NULL) {
+        had_state = 1;
+        saved_conv = layer->conv_state;
+        saved_ssm = layer->ssm_state;
+        layer->conv_state = NULL;
+        layer->ssm_state = NULL;
+    }
     layer_free(layer);
+    session->weight_stage_used = 0;
+    session->staged_layer = layer_index;
     layer->kind = kind;
     layer->n_embd = (int)session->gguf.embedding_length;
     layer->n_ff = (int)session->gguf.feed_forward_length;
@@ -691,33 +919,29 @@ static int load_layer_into(
     if (layer->n_embd <= 0 || layer->n_ff <= 0 || layer->n_heads <= 0 ||
         layer->n_kv_heads <= 0 || layer->head_dim <= 0 || layer->n_heads % layer->n_kv_heads != 0) {
         set_error(error, error_size, "native layer 架构参数无效");
-        return 0;
+        goto load_fail;
     }
     if (kind == EDGEXPU_LAYER_GATED_DELTA) {
         if (!load_layer_gated_delta(session, layer_index, layer, error, error_size)) {
-            layer_free(layer);
-            return 0;
+            goto load_fail;
         }
-        return 1;
+        goto load_ok;
     }
     if (kind == EDGEXPU_LAYER_ATTN_QK_NORM) {
         if (!load_layer_attn_qk_norm(session, layer_index, layer, error, error_size)) {
-            layer_free(layer);
-            return 0;
+            goto load_fail;
         }
-        return 1;
+        goto load_ok;
     }
 
 #define LOAD_BLK(field, tmpl) \
     do { \
         if (!edgexpu_arch_format_name(name, sizeof(name), (tmpl), layer_index)) { \
             set_error(error, error_size, "tensor 名过长"); \
-            layer_free(layer); \
-            return 0; \
+            goto load_fail; \
         } \
         if (!load_named_weight(session, name, &layer->field, error, error_size)) { \
-            layer_free(layer); \
-            return 0; \
+            goto load_fail; \
         } \
     } while (0)
 
@@ -725,12 +949,10 @@ static int load_layer_into(
     do { \
         if (!edgexpu_arch_format_name(name, sizeof(name), (tmpl), layer_index)) { \
             set_error(error, error_size, "tensor 名过长"); \
-            layer_free(layer); \
-            return 0; \
+            goto load_fail; \
         } \
         if (!load_qweight(session, name, (nout), (nin), &layer->field, error, error_size)) { \
-            layer_free(layer); \
-            return 0; \
+            goto load_fail; \
         } \
     } while (0)
 
@@ -750,45 +972,50 @@ static int load_layer_into(
     } else {
         if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_q_bias, layer_index) ||
             !load_named_weight_optional(session, name, &layer->bq, error, error_size)) {
-            layer_free(layer);
-            return 0;
+            goto load_fail;
         }
         if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_k_bias, layer_index) ||
             !load_named_weight_optional(session, name, &layer->bk, error, error_size)) {
-            layer_free(layer);
-            return 0;
+            goto load_fail;
         }
         if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_v_bias, layer_index) ||
             !load_named_weight_optional(session, name, &layer->bv, error, error_size)) {
-            layer_free(layer);
-            return 0;
+            goto load_fail;
         }
     }
     if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_output_bias, layer_index) ||
         !load_named_weight_optional(session, name, &layer->bo, error, error_size)) {
-        layer_free(layer);
-        return 0;
+        goto load_fail;
     }
     if (!edgexpu_arch_format_name(name, sizeof(name), names->ffn_gate_bias, layer_index) ||
         !load_named_weight_optional(session, name, &layer->bgate, error, error_size)) {
-        layer_free(layer);
-        return 0;
+        goto load_fail;
     }
     if (!edgexpu_arch_format_name(name, sizeof(name), names->ffn_up_bias, layer_index) ||
         !load_named_weight_optional(session, name, &layer->bup, error, error_size)) {
-        layer_free(layer);
-        return 0;
+        goto load_fail;
     }
     if (!edgexpu_arch_format_name(name, sizeof(name), names->ffn_down_bias, layer_index) ||
         !load_named_weight_optional(session, name, &layer->bdown, error, error_size)) {
-        layer_free(layer);
-        return 0;
+        goto load_fail;
     }
 #undef LOAD_BLK
 #undef LOAD_Q
 
     layer->ready = 1;
+load_ok:
+    if (had_state) {
+        free(layer->conv_state);
+        free(layer->ssm_state);
+        layer->conv_state = saved_conv;
+        layer->ssm_state = saved_ssm;
+    }
     return 1;
+load_fail:
+    layer_free(layer);
+    layer->conv_state = saved_conv;
+    layer->ssm_state = saved_ssm;
+    return 0;
 }
 
 static int load_layer(edgexpu_native_session *session, int layer_index, char *error, size_t error_size) {
@@ -801,22 +1028,17 @@ static void free_cached_layers(edgexpu_native_session *session) {
         return;
     }
     if (session->layers != NULL) {
-        memset(&session->layer0, 0, sizeof(session->layer0));
         for (i = 0; i < session->n_layers_cached; i++) {
             layer_free(&session->layers[i]);
         }
         free(session->layers);
         session->layers = NULL;
         session->n_layers_cached = 0;
-        return;
     }
-    layer_free(&session->layer0);
 }
 
 static int ensure_layers_cached(edgexpu_native_session *session, char *error, size_t error_size) {
     int n_layers;
-    int i;
-    int start = 0;
 
     n_layers = (int)session->gguf.block_count;
     if (n_layers <= 0) {
@@ -832,25 +1054,10 @@ static int ensure_layers_cached(edgexpu_native_session *session, char *error, si
     }
     session->layers = (edgexpu_native_layer *)calloc((size_t)n_layers, sizeof(edgexpu_native_layer));
     if (session->layers == NULL) {
-        set_error(error, error_size, "native 全层权重缓存分配失败");
+        set_error(error, error_size, "native 层槽分配失败");
         return 0;
     }
-
-    if (session->layer0.ready) {
-        session->layers[0] = session->layer0;
-        memset(&session->layer0, 0, sizeof(session->layer0));
-        session->n_layers_cached = 1;
-        start = 1;
-    }
-
-    for (i = start; i < n_layers; i++) {
-        if (!load_layer_into(session, i, &session->layers[i], error, error_size)) {
-            session->n_layers_cached = i;
-            return 0;
-        }
-        session->n_layers_cached = i + 1;
-    }
-    session->layer0 = session->layers[0];
+    session->n_layers_cached = n_layers;
     return 1;
 }
 
@@ -872,6 +1079,7 @@ void edgexpu_native_init(edgexpu_native_session *session) {
     }
     memset(session, 0, sizeof(*session));
     session->file_fd = -1;
+    session->staged_layer = -1;
     edgexpu_gguf_info_init(&session->gguf);
     edgexpu_tokenizer_init(&session->tokenizer);
     edgexpu_kv_cache_init(&session->kv);
@@ -937,14 +1145,11 @@ static int ensure_decode_scratch(
         set_error(error, error_size, "native decode workspace 尚未就绪");
         return 0;
     }
-    n_embd = session->layers[0].n_embd;
-    n_ff = session->layers[0].n_ff;
-    n_heads = session->layers[0].n_heads;
-    n_kv = session->layers[0].n_kv_heads;
+    n_embd = (int)session->gguf.embedding_length;
+    n_ff = (int)session->gguf.feed_forward_length;
+    n_heads = (int)session->gguf.head_count;
+    n_kv = (int)session->gguf.head_count_kv;
     head_dim = session_attn_head_dim(session);
-    if (head_dim < session->layers[0].head_dim) {
-        head_dim = session->layers[0].head_dim;
-    }
     if (cap_seq < 1) {
         cap_seq = 1;
     }
@@ -1001,6 +1206,15 @@ void edgexpu_native_free(edgexpu_native_session *session) {
     }
     free_decode_scratch(session);
     free_cached_layers(session);
+    layer_free(&session->layer0);
+    free(session->weight_stage);
+    session->weight_stage = NULL;
+    session->weight_stage_cap = 0;
+    session->weight_stage_used = 0;
+    session->staged_layer = -1;
+    free(session->kv_slot);
+    session->kv_slot = NULL;
+    session->n_kv_layers = 0;
     free(session->output_norm);
     session->output_norm = NULL;
     free(session->output_bias);
@@ -1024,7 +1238,7 @@ size_t edgexpu_native_memory_bytes(const edgexpu_native_session *session) {
     if (session == NULL || !session->loaded) {
         return 0;
     }
-    bytes = session->file_map_size + edgexpu_kv_cache_bytes(&session->kv);
+    bytes = session->weight_stage_cap + edgexpu_kv_cache_bytes(&session->kv);
     if (session->last_hidden != NULL && session->gguf.embedding_length > 0) {
         bytes += (size_t)session->gguf.embedding_length * sizeof(float);
     }
@@ -1069,11 +1283,38 @@ int edgexpu_native_load(
         edgexpu_native_free(session);
         return 0;
     }
+    {
+        size_t need = edgexpu_gguf_max_block_bytes(&session->gguf);
+        if (!ensure_weight_stage(session, need, error, error_size)) {
+            edgexpu_native_free(session);
+            return 0;
+        }
+    }
+    {
+        int n_layers = (int)session->gguf.block_count;
+        int i;
+        session->kv_slot = (int *)malloc((size_t)n_layers * sizeof(int));
+        if (n_layers > 0 && session->kv_slot == NULL) {
+            set_error(error, error_size, "native KV 槽表分配失败");
+            edgexpu_native_free(session);
+            return 0;
+        }
+        session->n_kv_layers = 0;
+        for (i = 0; i < n_layers; i++) {
+            edgexpu_layer_kind kind = edgexpu_arch_layer_kind(&session->arch, &session->gguf, i);
+            if (edgexpu_layer_kind_uses_kv(kind)) {
+                session->kv_slot[i] = session->n_kv_layers;
+                session->n_kv_layers++;
+            } else {
+                session->kv_slot[i] = -1;
+            }
+        }
+    }
 
-    if (session->gguf.block_count > 0 && session->gguf.head_count_kv > 0 && head_dim > 0) {
+    if (session->n_kv_layers > 0 && session->gguf.head_count_kv > 0 && head_dim > 0) {
         if (!edgexpu_kv_cache_allocate(
                 &session->kv,
-                (int)session->gguf.block_count,
+                session->n_kv_layers,
                 (int)session->gguf.head_count_kv,
                 head_dim,
                 max_seq,
@@ -1222,7 +1463,7 @@ int edgexpu_native_ensure_window(
         return 0;
     }
 
-    n_layers = (int)session->gguf.block_count;
+    n_layers = session->n_kv_layers > 0 ? session->n_kv_layers : (int)session->gguf.block_count;
     n_kv = (int)session->gguf.head_count_kv;
     head_dim = session_attn_head_dim(session);
     if (n_layers <= 0 || n_kv <= 0 || head_dim <= 0) {
@@ -1593,7 +1834,7 @@ static int apply_attn_qk_norm_layer(
             for (s = 0; s <= pos_base + t; s++) {
                 float *kh;
                 if (s < pos_base) {
-                    kh = edgexpu_kv_cache_k_at(&session->kv, layer_index, s);
+                    kh = native_kv_k_at(session, layer_index, s);
                     if (kh == NULL) {
                         free(q_full);
                         free(q_use);
@@ -1612,7 +1853,7 @@ static int apply_attn_qk_norm_layer(
             for (s = 0; s <= pos_base + t; s++) {
                 float *vh;
                 if (s < pos_base) {
-                    vh = edgexpu_kv_cache_v_at(&session->kv, layer_index, s);
+                    vh = native_kv_v_at(session, layer_index, s);
                     if (vh == NULL) {
                         free(q_full);
                         free(q_use);
@@ -1638,8 +1879,8 @@ static int apply_attn_qk_norm_layer(
     }
 
     for (t = 0; t < seq; t++) {
-        float *k_slot = edgexpu_kv_cache_k_at(&session->kv, layer_index, pos_base + t);
-        float *v_slot = edgexpu_kv_cache_v_at(&session->kv, layer_index, pos_base + t);
+        float *k_slot = native_kv_k_at(session, layer_index, pos_base + t);
+        float *v_slot = native_kv_v_at(session, layer_index, pos_base + t);
         if (k_slot == NULL || v_slot == NULL) {
             free(q_full);
             free(q_use);
@@ -1777,8 +2018,8 @@ static int apply_transformer_layer(
     }
 
     for (t = 0; t < seq; t++) {
-        float *k_slot = edgexpu_kv_cache_k_at(&session->kv, layer_index, t);
-        float *v_slot = edgexpu_kv_cache_v_at(&session->kv, layer_index, t);
+        float *k_slot = native_kv_k_at(session, layer_index, t);
+        float *v_slot = native_kv_v_at(session, layer_index, t);
         if (k_slot == NULL || v_slot == NULL) {
             set_error(error, error_size, "native prefill 无法写入 KV cache");
             return 0;
@@ -1856,7 +2097,7 @@ int edgexpu_native_forward_prefill(
         set_error(error, error_size, "native prefill 需要先 tokenize");
         return 0;
     }
-    if (session->kv.k == NULL) {
+    if (session->n_kv_layers > 0 && session->kv.k == NULL) {
         set_error(error, error_size, "native KV cache 尚未就绪");
         return 0;
     }
@@ -1870,13 +2111,13 @@ int edgexpu_native_forward_prefill(
         return 0;
     }
 
-    n_embd = session->layers[0].n_embd;
-    n_ff = session->layers[0].n_ff;
-    n_heads = session->layers[0].n_heads;
-    n_kv = session->layers[0].n_kv_heads;
+    n_embd = (int)session->gguf.embedding_length;
+    n_ff = (int)session->gguf.feed_forward_length;
+    n_heads = (int)session->gguf.head_count;
+    n_kv = (int)session->gguf.head_count_kv;
     head_dim = session_attn_head_dim(session);
     seq = session->token_count;
-    if (seq > session->kv.max_seq) {
+    if (session->kv.k != NULL && seq > session->kv.max_seq) {
         snprintf(
             error,
             error_size,
@@ -1920,10 +2161,14 @@ int edgexpu_native_forward_prefill(
             goto cleanup;
         }
     }
+    native_dontneed_tensor(session, embd);
 
     edgexpu_kv_cache_reset(&session->kv);
     for (layer_index = 0; layer_index < n_layers; layer_index++) {
         edgexpu_native_layer *ly = &session->layers[layer_index];
+        if (!load_layer_into(session, layer_index, ly, error, error_size)) {
+            goto cleanup;
+        }
         if (ly->conv_state != NULL && ly->qkv_dim > 0 && ly->ssm_conv_k > 1) {
             memset(
                 ly->conv_state,
@@ -1938,11 +2183,9 @@ int edgexpu_native_forward_prefill(
                 (size_t)ly->ssm_n_v * (size_t)ly->ssm_dk * (size_t)ly->ssm_dv * sizeof(float)
             );
         }
-    }
-    for (layer_index = 0; layer_index < n_layers; layer_index++) {
         if (!apply_transformer_layer(
                 session,
-                &session->layers[layer_index],
+                ly,
                 layer_index,
                 seq,
                 hidden,
@@ -1960,6 +2203,7 @@ int edgexpu_native_forward_prefill(
                 error_size)) {
             goto cleanup;
         }
+        native_dontneed_layer(session, layer_index);
     }
 
     for (t = 0; t < seq; t++) {
@@ -1968,7 +2212,7 @@ int edgexpu_native_forward_prefill(
         edgexpu_cpu_rmsnorm(xt, residual, session->output_norm, n_embd, eps);
     }
 
-    if (!edgexpu_kv_cache_extend(&session->kv, seq, error, error_size)) {
+    if (session->kv.k != NULL && !edgexpu_kv_cache_extend(&session->kv, seq, error, error_size)) {
         goto cleanup;
     }
 
@@ -2015,6 +2259,35 @@ int edgexpu_native_forward_layer0(
     return edgexpu_native_forward_prefill(session, error, error_size);
 }
 
+static size_t logit_chunk_rows(const edgexpu_gguf_tensor *tensor, int n_embd) {
+    size_t row_bytes;
+    size_t n;
+    if (tensor == NULL || n_embd <= 0) {
+        return 1;
+    }
+    row_bytes = edgexpu_gguf_row_bytes(tensor->type, n_embd);
+    if (row_bytes == 0) {
+        return 1;
+    }
+    n = EDGEXPU_BUDGET_OUTPUT_CHUNK_BYTES / row_bytes;
+    return n < 1u ? 1u : n;
+}
+
+static void dontneed_logit_rows(
+    const edgexpu_native_session *session,
+    const edgexpu_gguf_tensor *tensor,
+    uint32_t row0,
+    uint32_t nrows,
+    int n_embd
+) {
+    const uint8_t *src = tensor_bytes(session, tensor);
+    size_t row_bytes = edgexpu_gguf_row_bytes(tensor->type, n_embd);
+    if (src == NULL || row_bytes == 0 || nrows == 0) {
+        return;
+    }
+    native_page_advise(src + (size_t)row0 * row_bytes, (size_t)nrows * row_bytes, 0);
+}
+
 /* temperature≈0 为 greedy：只扫 argmax。否则 softmax，可选 top_p nucleus。 */
 static int sample_next_token(
     edgexpu_native_session *session,
@@ -2032,8 +2305,9 @@ static int sample_next_token(
     float best_score;
     uint8_t *x_q8 = NULL;
     static uint64_t rng = 0x00ED6E50ULL;
+    size_t chunk;
 
-    n_embd = session->layers[0].n_embd;
+    n_embd = (int)session->gguf.embedding_length;
     vocab = (int)session->tokenizer.vocab_size;
     weights = logit_weight_tensor(session);
     if (weights == NULL || session->last_hidden == NULL || vocab <= 0) {
@@ -2043,19 +2317,28 @@ static int sample_next_token(
     if (edgexpu_gguf_can_dot_q8(weights->type)) {
         x_q8 = quantize_hidden_q8(session->last_hidden, n_embd);
     }
+    chunk = logit_chunk_rows(weights, n_embd);
 
     if (temperature > 1e-4f) {
         float *logits = (float *)malloc((size_t)vocab * sizeof(float));
+        uint32_t begin;
         if (logits == NULL) {
             free(x_q8);
             set_error(error, error_size, "native logits 分配失败");
             return 0;
         }
+        for (begin = 0; begin < (uint32_t)vocab; begin += (uint32_t)chunk) {
+            uint32_t end = begin + (uint32_t)chunk;
+            if (end > (uint32_t)vocab) {
+                end = (uint32_t)vocab;
+            }
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(vocab >= 256)
+#pragma omp parallel for schedule(static) if((end - begin) >= 256)
 #endif
-        for (i = 0; i < (uint32_t)vocab; i++) {
-            logits[i] = logit_score(session, weights, i, n_embd, x_q8) / temperature;
+            for (i = begin; i < end; i++) {
+                logits[i] = logit_score(session, weights, i, n_embd, x_q8) / temperature;
+            }
+            dontneed_logit_rows(session, weights, begin, end - begin, n_embd);
         }
         if (!edgexpu_cpu_sample_softmax(logits, vocab, top_p, &rng, &best)) {
             free(logits);
@@ -2071,37 +2354,47 @@ static int sample_next_token(
 
     best_score = -INFINITY;
     best = 0;
-#if defined(_OPENMP)
-#pragma omp parallel if(vocab >= 256)
     {
-        uint32_t local_best = 0;
-        float local_score = -INFINITY;
-        uint32_t i_local;
+        uint32_t begin;
+        for (begin = 0; begin < (uint32_t)vocab; begin += (uint32_t)chunk) {
+            uint32_t end = begin + (uint32_t)chunk;
+            if (end > (uint32_t)vocab) {
+                end = (uint32_t)vocab;
+            }
+#if defined(_OPENMP)
+#pragma omp parallel if((end - begin) >= 256)
+            {
+                uint32_t local_best = 0;
+                float local_score = -INFINITY;
+                uint32_t i_local;
 #pragma omp for nowait schedule(static)
-        for (i_local = 0; i_local < (uint32_t)vocab; i_local++) {
-            float score = logit_score(session, weights, i_local, n_embd, x_q8);
-            if (score > local_score) {
-                local_score = score;
-                local_best = i_local;
-            }
-        }
+                for (i_local = begin; i_local < end; i_local++) {
+                    float score = logit_score(session, weights, i_local, n_embd, x_q8);
+                    if (score > local_score) {
+                        local_score = score;
+                        local_best = i_local;
+                    }
+                }
 #pragma omp critical
-        {
-            if (local_score > best_score || (local_score == best_score && local_best < best)) {
-                best_score = local_score;
-                best = local_best;
+                {
+                    if (local_score > best_score || (local_score == best_score && local_best < best)) {
+                        best_score = local_score;
+                        best = local_best;
+                    }
+                }
             }
-        }
-    }
 #else
-    for (i = 0; i < (uint32_t)vocab; i++) {
-        float score = logit_score(session, weights, i, n_embd, x_q8);
-        if (score > best_score) {
-            best_score = score;
-            best = i;
+            for (i = begin; i < end; i++) {
+                float score = logit_score(session, weights, i, n_embd, x_q8);
+                if (score > best_score) {
+                    best_score = score;
+                    best = i;
+                }
+            }
+#endif
+            dontneed_logit_rows(session, weights, begin, end - begin, n_embd);
         }
     }
-#endif
     free(x_q8);
     *token_id = best;
     return 1;
@@ -2143,21 +2436,24 @@ static int forward_decode_token(
     float *scores;
 
     pos = session->kv.seq_len;
-    n_layers = session->n_layers_cached;
-    n_embd = session->layers[0].n_embd;
-    n_ff = session->layers[0].n_ff;
-    n_heads = session->layers[0].n_heads;
-    n_kv = session->layers[0].n_kv_heads;
+    n_layers = (int)session->gguf.block_count;
+    n_embd = (int)session->gguf.embedding_length;
+    n_ff = (int)session->gguf.feed_forward_length;
+    n_heads = (int)session->gguf.head_count;
+    n_kv = (int)session->gguf.head_count_kv;
     head_dim = session_attn_head_dim(session);
     n_rep = n_heads / n_kv;
     eps = session->gguf.rms_eps > 0.0f ? session->gguf.rms_eps : 1e-6f;
     attn_scale = 1.0f / sqrtf((float)head_dim);
 
-    if (pos < 0 || pos >= session->kv.max_seq) {
+    if (session->kv.k != NULL && (pos < 0 || pos >= session->kv.max_seq)) {
         set_error(error, error_size, "native decode 超出 KV 窗口");
         return 0;
     }
-    if (!ensure_decode_scratch(session, session->kv.max_seq, error, error_size)) {
+    if (!ensure_layers_cached(session, error, error_size)) {
+        return 0;
+    }
+    if (!ensure_decode_scratch(session, session->kv.max_seq > 0 ? session->kv.max_seq : 1, error, error_size)) {
         return 0;
     }
     ws = (native_decode_scratch *)session->scratch;
@@ -2177,12 +2473,17 @@ static int forward_decode_token(
     if (!load_embedding_row(session, token, n_embd, hidden, error, error_size)) {
         return 0;
     }
+    native_dontneed_tensor(session, token_embedding_tensor(session));
 
     for (layer_index = 0; layer_index < n_layers; layer_index++) {
         float *k_slot;
         float *v_slot;
+        edgexpu_native_layer *ly = &session->layers[layer_index];
 
-        layer = &session->layers[layer_index];
+        if (!load_layer_into(session, layer_index, ly, error, error_size)) {
+            return 0;
+        }
+        layer = ly;
         if (layer->kind == EDGEXPU_LAYER_GATED_DELTA) {
             if (!apply_gated_delta_layer(
                     session,
@@ -2197,6 +2498,7 @@ static int forward_decode_token(
                     error_size)) {
                 return 0;
             }
+            native_dontneed_layer(session, layer_index);
             continue;
         }
         if (layer->kind == EDGEXPU_LAYER_ATTN_QK_NORM) {
@@ -2221,6 +2523,7 @@ static int forward_decode_token(
                     error_size)) {
                 return 0;
             }
+            native_dontneed_layer(session, layer_index);
             continue;
         }
         edgexpu_cpu_rmsnorm(normed, hidden, layer->attn_norm, n_embd, eps);
@@ -2230,8 +2533,8 @@ static int forward_decode_token(
         apply_rope(session, q, n_heads, head_dim, pos);
         apply_rope(session, k, n_kv, head_dim, pos);
 
-        k_slot = edgexpu_kv_cache_k_at(&session->kv, layer_index, pos);
-        v_slot = edgexpu_kv_cache_v_at(&session->kv, layer_index, pos);
+        k_slot = native_kv_k_at(session, layer_index, pos);
+        v_slot = native_kv_v_at(session, layer_index, pos);
         if (k_slot == NULL || v_slot == NULL) {
             set_error(error, error_size, "native decode 无法写入 KV cache");
             return 0;
@@ -2245,7 +2548,7 @@ static int forward_decode_token(
             float *out_h = attn + (size_t)h * (size_t)head_dim;
             memset(out_h, 0, (size_t)head_dim * sizeof(float));
             for (s = 0; s <= pos; s++) {
-                float *kh = edgexpu_kv_cache_k_at(&session->kv, layer_index, s);
+                float *kh = native_kv_k_at(session, layer_index, s);
                 if (kh == NULL) {
                     set_error(error, error_size, "native decode 无法读取 K");
                     return 0;
@@ -2255,7 +2558,7 @@ static int forward_decode_token(
             }
             edgexpu_cpu_softmax(scores, pos + 1);
             for (s = 0; s <= pos; s++) {
-                float *vh = edgexpu_kv_cache_v_at(&session->kv, layer_index, s);
+                float *vh = native_kv_v_at(session, layer_index, s);
                 if (vh == NULL) {
                     set_error(error, error_size, "native decode 无法读取 V");
                     return 0;
@@ -2276,13 +2579,14 @@ static int forward_decode_token(
         edgexpu_cpu_mul(gate, gate, up, n_ff);
         apply_qlinear(down, gate, &layer->wdown, layer->bdown);
         edgexpu_cpu_add(hidden, residual, down, n_embd);
+        native_dontneed_layer(session, layer_index);
     }
 
     memcpy(residual, hidden, (size_t)n_embd * sizeof(float));
     edgexpu_cpu_rmsnorm(hidden, residual, session->output_norm, n_embd, eps);
     memcpy(session->last_hidden, hidden, (size_t)n_embd * sizeof(float));
     session->last_hidden_rms = vector_rms(session->last_hidden, n_embd);
-    if (!edgexpu_kv_cache_extend(&session->kv, 1, error, error_size)) {
+    if (session->kv.k != NULL && !edgexpu_kv_cache_extend(&session->kv, 1, error, error_size)) {
         return 0;
     }
     if (session->token_count >= session->token_ids_cap) {
@@ -2530,20 +2834,31 @@ int edgexpu_native_dump_logits(
     for (i = 0; i < top_k; i++) {
         top_scores[i] = -1.0e30f;
     }
-    for (i = 0; i < vocab; i++) {
-        float score = logit_score(session, weights, (uint32_t)i, n_embd, x_q8);
-        int slot;
-        slot = top_k - 1;
-        if (score <= top_scores[slot]) {
-            continue;
+    {
+        size_t chunk = logit_chunk_rows(weights, n_embd);
+        uint32_t begin;
+        for (begin = 0; begin < (uint32_t)vocab; begin += (uint32_t)chunk) {
+            uint32_t end = begin + (uint32_t)chunk;
+            uint32_t row;
+            if (end > (uint32_t)vocab) {
+                end = (uint32_t)vocab;
+            }
+            for (row = begin; row < end; row++) {
+                float score = logit_score(session, weights, row, n_embd, x_q8);
+                int slot = top_k - 1;
+                if (score <= top_scores[slot]) {
+                    continue;
+                }
+                while (slot > 0 && score > top_scores[slot - 1]) {
+                    top_scores[slot] = top_scores[slot - 1];
+                    top_ids[slot] = top_ids[slot - 1];
+                    slot--;
+                }
+                top_scores[slot] = score;
+                top_ids[slot] = row;
+            }
+            dontneed_logit_rows(session, weights, begin, end - begin, n_embd);
         }
-        while (slot > 0 && score > top_scores[slot - 1]) {
-            top_scores[slot] = top_scores[slot - 1];
-            top_ids[slot] = top_ids[slot - 1];
-            slot--;
-        }
-        top_scores[slot] = score;
-        top_ids[slot] = (uint32_t)i;
     }
     printf("logits_topk=%d\n", top_k);
     for (i = 0; i < top_k; i++) {
@@ -2734,6 +3049,7 @@ int edgexpu_native_selftest(const char *gguf_path) {
             plan.window,
             session.arch.plugin != NULL ? session.arch.plugin->id : session.arch.name
         );
+        printf("budget_reason=%s\n", plan.reason);
     }
     if (!edgexpu_native_tokenize(&session, "Hello EdgeXPU", error, sizeof(error)) ||
         session.token_count <= 0) {
@@ -2791,8 +3107,8 @@ int edgexpu_native_selftest(const char *gguf_path) {
             kv_first = 0;
             kv_last = last_layer >= 0 ? last_layer : 0;
         }
-        k0 = edgexpu_kv_cache_k_at(&session.kv, kv_first, 0);
-        klast = kv_last >= 0 ? edgexpu_kv_cache_k_at(&session.kv, kv_last, 0) : NULL;
+        k0 = native_kv_k_at(&session, kv_first, 0);
+        klast = kv_last >= 0 ? native_kv_k_at(&session, kv_last, 0) : NULL;
         kv_dim = session.layers[kv_last >= 0 ? kv_last : 0].n_kv_heads *
             session.layers[kv_last >= 0 ? kv_last : 0].head_dim;
         if (k0 == NULL || klast == NULL ||

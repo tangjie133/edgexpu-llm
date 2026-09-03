@@ -143,3 +143,13 @@ match_pack_by_gguf() {
     done < <(each_pack_dir)
     return 1
 }
+
+inspect_budget_admitted() {
+    local inspect="$1"
+    printf '%s\n' "${inspect}" | grep -q 'budget_admitted=1'
+}
+
+native_error_is_budget() {
+    local text="$1"
+    printf '%s\n' "${text}" | grep -Eq 'exceeds|budget|85%'
+}

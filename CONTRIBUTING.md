@@ -44,7 +44,7 @@ Qwen3.5 包是 `NATIVE=1` 的 hybrid 示例：plugin 选层类型，forward 走�
 
 ## 资源调度
 
-`edgexpu_scheduler_estimate_gguf` 估算 mmap 权重 + KV + prefill scratch，超过设备内存 85% 则拒绝 `native_load`。调试可设 `EDGEXPU_BUDGET_DISABLE=1`（不要默认关）。
+`edgexpu_scheduler_estimate_gguf` 估算**工作集**（最大 `blk.*` 层 + 输出分块 + embedding 一行 + 注意力层 KV + 有限 scratch），不是整文件 mmap。超过设备内存 85% 则拒绝 `native_load`。调试可设 `EDGEXPU_BUDGET_DISABLE=1`（不要默认关）。verify 在预算拒绝时 skip 该 pack，继续找下一个已准入的 `NATIVE=1` 产品包。
 
 ## 验证
 

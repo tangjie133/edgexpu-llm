@@ -73,6 +73,10 @@ edgexpu_layer_kind edgexpu_arch_layer_kind(
     return EDGEXPU_LAYER_ATTN_SWIGLU;
 }
 
+int edgexpu_layer_kind_uses_kv(edgexpu_layer_kind kind) {
+    return kind == EDGEXPU_LAYER_ATTN_SWIGLU || kind == EDGEXPU_LAYER_ATTN_QK_NORM;
+}
+
 const char *edgexpu_rope_type_name(edgexpu_rope_type rope) {
     switch (rope) {
         case EDGEXPU_ROPE_NEOX:

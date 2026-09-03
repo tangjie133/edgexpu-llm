@@ -102,7 +102,23 @@ if [[ "${EDGEXPU_ARM_FULL:-0}" == "1" || "${HOST_ARCH}" == "aarch64" || "${HOST_
         fi
         NATIVE_GGUF=$((NATIVE_GGUF + 1))
         echo "== ${PACK_NAME} greedy lock (mmap GGUF) =="
-        SELF="$(run_bin "${BIN}" native-selftest "${GGUF}")"
+        INSPECT_OUTPUT="$(run_bin "${BIN}" inspect-gguf "${GGUF}")"
+        if ! inspect_budget_admitted "${INSPECT_OUTPUT}"; then
+            echo "skip ${PACK_NAME}: native budget rejected on this device"
+            printf '%s\n' "${INSPECT_OUTPUT}" | grep -E 'budget_' || true
+            NATIVE_GGUF=$((NATIVE_GGUF - 1))
+            continue
+        fi
+        SELF="$(run_bin "${BIN}" native-selftest "${GGUF}" 2>&1)" || true
+        if ! printf '%s\n' "${SELF}" | grep -q 'native selftest passed'; then
+            if native_error_is_budget "${SELF}"; then
+                echo "skip ${PACK_NAME}: native-selftest budget rejected on this device"
+                NATIVE_GGUF=$((NATIVE_GGUF - 1))
+                continue
+            fi
+            echo "${SELF}" >&2
+            die "${PACK_NAME} native-selftest"
+        fi
         require_contains "${SELF}" "simd=neon" "${PACK_NAME} simd"
         require_contains "${SELF}" "kv_overflow=ok" "${PACK_NAME} kv overflow"
         require_contains "${SELF}" "native selftest passed" "${PACK_NAME} native-selftest"

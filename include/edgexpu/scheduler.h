@@ -31,12 +31,16 @@ typedef struct edgexpu_schedule_decision {
     char fallback_reason[EDGEXPU_TEXT_MEDIUM];
 } edgexpu_schedule_decision;
 
+#define EDGEXPU_BUDGET_OUTPUT_CHUNK_BYTES ((size_t)48u * 1024u * 1024u)
+#define EDGEXPU_BUDGET_SCRATCH_SEQ 64
+
 typedef struct edgexpu_resource_plan {
     size_t weight_bytes;
     size_t kv_bytes;
     size_t scratch_bytes;
     size_t total_bytes;
     size_t limit_bytes;
+    size_t file_bytes;
     int window;
     int admitted;
     char reason[EDGEXPU_TEXT_MEDIUM];

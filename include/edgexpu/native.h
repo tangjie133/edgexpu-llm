@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 /* Native CPU fallback：mmap GGUF、按 adapter 跑 transformer、逐步 decode。
- * 这是产品 CPU 路径，不是 llama.cpp wrapper。层数/RoPE/bias 来自 GGUF + adapter。
+ * 量化权重按层拷进 staging，不按整文件计入工作集。
  */
 
 #define EDGEXPU_NATIVE_MAX_TOKENS 1024 /* 仅作无 context_length 时的 token_ids 下限 */
@@ -84,9 +84,15 @@ typedef struct edgexpu_native_session {
     float *last_hidden;          /* 最近一次 prefill/decode 的最后位置隐状态，用于算 logits */
     uint32_t *token_ids;         /* 容量 token_ids_cap，随 context / KV 窗口分配 */
     int token_ids_cap;
-    const uint8_t *file_map;     /* 整文件 mmap，tensor 按偏移读取 */
+    const uint8_t *file_map;     /* 整文件 mmap，tensor 按偏移读取；RSS 靠 staging + DONTNEED */
     size_t file_map_size;
     int file_fd;
+    uint8_t *weight_stage;       /* 当前层量化权重工作集 */
+    size_t weight_stage_cap;
+    size_t weight_stage_used;
+    int staged_layer;
+    int *kv_slot;                /* 层号 → KV 槽；GDN 为 -1 */
+    int n_kv_layers;
     int token_count;
     int prompt_token_count;
     int generated_tokens;
@@ -101,8 +107,11 @@ typedef struct edgexpu_native_session {
 void edgexpu_native_init(edgexpu_native_session *session);
 void edgexpu_native_free(edgexpu_native_session *session);
 
-/* mmap 的 GGUF 字节 + 当前 KV 缓冲。供 telemetry.memory_used_mb。 */
+/* mmap 工作集（staging + KV + scratch），不是整文件。 */
 size_t edgexpu_native_memory_bytes(const edgexpu_native_session *session);
+
+/* prefetch job：对下一层 blk.* 做 WILLNEED，禁止整文件。 */
+void edgexpu_native_prefetch_hint(edgexpu_native_session *session);
 
 /* 读 GGUF、选 adapter、mmap、分配 KV、加载第 0 层与 output_norm。 */
 int edgexpu_native_load(

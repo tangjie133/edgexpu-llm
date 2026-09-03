@@ -1,6 +1,9 @@
 #include "edgexpu/gguf.h"
+#include "edgexpu/gguf_quant.h"
 
 #include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -288,6 +291,68 @@ const edgexpu_gguf_tensor *edgexpu_gguf_find_tensor(
         }
     }
     return NULL;
+}
+
+int edgexpu_gguf_tensor_block_index(const char *name) {
+    unsigned long index;
+    char *end = NULL;
+    if (name == NULL || strncmp(name, "blk.", 4) != 0) {
+        return -1;
+    }
+    index = strtoul(name + 4, &end, 10);
+    if (end == name + 4 || end == NULL || *end != '.') {
+        return -1;
+    }
+    if (index > (unsigned long)INT_MAX) {
+        return -1;
+    }
+    return (int)index;
+}
+
+size_t edgexpu_gguf_max_block_bytes(const edgexpu_gguf_info *info) {
+    size_t *sums = NULL;
+    size_t max_bytes = 0;
+    uint32_t n_layers;
+    uint32_t i;
+
+    if (info == NULL || info->n_tensors == 0) {
+        return 0;
+    }
+    n_layers = info->block_count;
+    if (n_layers == 0) {
+        for (i = 0; i < info->n_tensors; i++) {
+            int block = edgexpu_gguf_tensor_block_index(info->tensors[i].name);
+            if (block >= 0 && (uint32_t)(block + 1) > n_layers) {
+                n_layers = (uint32_t)(block + 1);
+            }
+        }
+    }
+    if (n_layers == 0) {
+        return 0;
+    }
+    sums = (size_t *)calloc((size_t)n_layers, sizeof(size_t));
+    if (sums == NULL) {
+        return 0;
+    }
+    for (i = 0; i < info->n_tensors; i++) {
+        int block = edgexpu_gguf_tensor_block_index(info->tensors[i].name);
+        size_t nbytes;
+        if (block < 0 || (uint32_t)block >= n_layers) {
+            continue;
+        }
+        nbytes = edgexpu_gguf_tensor_nbytes(&info->tensors[i]);
+        if (nbytes == 0 || sums[block] > SIZE_MAX - nbytes) {
+            continue;
+        }
+        sums[block] += nbytes;
+    }
+    for (i = 0; i < n_layers; i++) {
+        if (sums[i] > max_bytes) {
+            max_bytes = sums[i];
+        }
+    }
+    free(sums);
+    return max_bytes;
 }
 
 /* 顺序读 header → KV（含 architecture / tokenizer / chat_template）→ tensor 表 → 对齐 data_offset。 */
