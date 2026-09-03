@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 
+/* 临时 CPU bootstrap：shell-out 到 llama / llama-cli。不是产品推理路径。 */
+
 #if defined(_WIN32)
 #include <windows.h>
 #define EDGEXPU_POPEN _popen
@@ -46,7 +48,7 @@ static double now_seconds(void) {
 }
 
 static int command_exists(const char *command) {
-    char check_command[256];
+    char check_command[EDGEXPU_TEXT_MEDIUM + 64];
 #if defined(_WIN32)
     char line[512];
     FILE *pipe;
@@ -388,17 +390,32 @@ static int cpu_baseline_generate(
     shell_quote(g_loaded_manifest.primary_artifact.path, quoted_model, sizeof(quoted_model));
     shell_quote(request->prompt, quoted_prompt, sizeof(quoted_prompt));
 
-    command_length = snprintf(
-        shell_command,
-        sizeof(shell_command),
-        "%s -m %s -p %s -n %d --temp %.3f%s",
-        command_prefix,
-        quoted_model,
-        quoted_prompt,
-        request->max_tokens,
-        request->temperature,
-        extra_args
-    );
+    if (request->top_p > 0.0f && request->top_p < 1.0f) {
+        command_length = snprintf(
+            shell_command,
+            sizeof(shell_command),
+            "%s -m %s -p %s -n %d --temp %.3f --top-p %.3f%s",
+            command_prefix,
+            quoted_model,
+            quoted_prompt,
+            request->max_tokens,
+            request->temperature,
+            request->top_p,
+            extra_args
+        );
+    } else {
+        command_length = snprintf(
+            shell_command,
+            sizeof(shell_command),
+            "%s -m %s -p %s -n %d --temp %.3f%s",
+            command_prefix,
+            quoted_model,
+            quoted_prompt,
+            request->max_tokens,
+            request->temperature,
+            extra_args
+        );
+    }
     if (command_length < 0 || (size_t)command_length >= sizeof(shell_command)) {
         set_error(error, error_size, "CPU baseline 命令过长");
         return 0;

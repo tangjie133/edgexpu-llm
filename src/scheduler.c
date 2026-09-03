@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+/* 按 job 类型填 backend/device/policy。native 就绪时 tokenize/prefill/decode 标 cpu.native。 */
+
 static void set_error(char *error, size_t error_size, const char *message) {
     if (error != NULL && error_size > 0) {
         snprintf(error, error_size, "%s", message);
@@ -22,8 +24,10 @@ static int manifest_supports_cpu_baseline(const edgexpu_model_manifest *manifest
 
     return strcmp(manifest->fallback_policy, "cpu.llama_cpp") == 0 ||
         strcmp(manifest->fallback_policy, "cpu.baseline") == 0 ||
+        strcmp(manifest->fallback_policy, "cpu.native") == 0 ||
         strcmp(manifest->primary_artifact.backend, "cpu.llama_cpp") == 0 ||
-        strcmp(manifest->primary_artifact.backend, "cpu.baseline") == 0;
+        strcmp(manifest->primary_artifact.backend, "cpu.baseline") == 0 ||
+        strcmp(manifest->primary_artifact.backend, "cpu.native") == 0;
 }
 
 static const char *cpu_baseline_reason(edgexpu_executor_job_type job_type) {
@@ -35,9 +39,9 @@ static const char *cpu_baseline_reason(edgexpu_executor_job_type job_type) {
         case EDGEXPU_EXECUTOR_JOB_TOKENIZE:
             return "tokenizer is not connected to the native backend yet; CPU placeholder is used";
         case EDGEXPU_EXECUTOR_JOB_PREFILL:
-            return "prefill uses CPU baseline until NPU/dNPU execution is available";
+            return "prefill uses CPU baseline until native session or NPU/dNPU is available";
         case EDGEXPU_EXECUTOR_JOB_DECODE_STEP:
-            return "decode uses CPU baseline until native async executor is available";
+            return "decode uses CPU baseline until native session or NPU/dNPU is available";
         case EDGEXPU_EXECUTOR_JOB_UPDATE_KV_CACHE:
             return "KV cache bookkeeping belongs to the memory pipeline";
         case EDGEXPU_EXECUTOR_JOB_PREFETCH_WEIGHTS:
@@ -51,6 +55,7 @@ static const char *cpu_baseline_reason(edgexpu_executor_job_type job_type) {
     }
 }
 
+/* 无 NPU runtime 时回落到 cpu.baseline。 */
 static void select_execution_backend(
     const edgexpu_model_manifest *manifest,
     const edgexpu_device_profile *profile,
@@ -97,6 +102,12 @@ static void select_execution_backend(
         return;
     }
 
+    if (strcmp(manifest->primary_artifact.backend, "cpu.native") == 0) {
+        copy_text(backend, backend_size, "cpu.native");
+        copy_text(device, device_size, "cpu");
+        return;
+    }
+
     copy_text(backend, backend_size, "cpu.baseline");
     copy_text(device, device_size, "cpu");
 }
@@ -126,6 +137,7 @@ static void select_policy_name(edgexpu_executor_job_type job_type, char *output,
     }
 }
 
+/* 用上一次 decode tok/s 标注下次 plan；native 用 telemetry_keep_native，避免看起来像 baseline。 */
 static void apply_telemetry_hint(
     const edgexpu_backend_telemetry *last_telemetry,
     edgexpu_schedule_decision *decision
@@ -148,7 +160,11 @@ static void apply_telemetry_hint(
     decode_tokens_per_second =
         (double)last_telemetry->completion_tokens_approx / last_telemetry->decode_seconds;
 
-    copy_text(decision->policy, sizeof(decision->policy), "telemetry_keep_cpu");
+    copy_text(
+        decision->policy,
+        sizeof(decision->policy),
+        strcmp(decision->backend, "cpu.native") == 0 ? "telemetry_keep_native" : "telemetry_keep_cpu"
+    );
     copy_text(annotated_reason, sizeof(annotated_reason), decision->reason);
     used = strlen(annotated_reason);
     if (used + 1 < sizeof(annotated_reason)) {
@@ -164,9 +180,10 @@ static void apply_telemetry_hint(
     snprintf(
         decision->fallback_reason,
         sizeof(decision->fallback_reason),
-        "previous %s decode throughput %.2f tok/s; keep CPU baseline until native/NPU/dNPU backend is available",
+        "previous %s decode throughput %.2f tok/s; keep %s until NPU/dNPU backend is available",
         last_telemetry->backend,
-        decode_tokens_per_second
+        decode_tokens_per_second,
+        decision->backend
     );
 }
 
@@ -305,10 +322,12 @@ int edgexpu_scheduler_plan_job_with_context(
         }
         if (native->kv && job_type == EDGEXPU_EXECUTOR_JOB_PREFILL) {
             if (native->kernel) {
+                copy_text(decision->backend, sizeof(decision->backend), "cpu.native");
+                copy_text(decision->policy, sizeof(decision->policy), "native_prefill");
                 copy_text(
                     decision->reason,
                     sizeof(decision->reason),
-                    "native prefill runs all transformer layers and writes full KV cache; decode still uses CPU baseline"
+                    "native prefill runs all transformer layers and writes full KV cache"
                 );
             } else {
                 copy_text(

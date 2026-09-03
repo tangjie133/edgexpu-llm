@@ -21,17 +21,20 @@ static void print_usage(void) {
     printf("Usage:\n");
     printf("  edgexpu capabilities\n");
     printf("  edgexpu inspect-manifest <manifest.json>\n");
-    printf("  edgexpu benchmark <manifest.json> <prompt>\n");
+    printf("  edgexpu generate <manifest.json> <prompt> [max_tokens]\n");
+    printf("  edgexpu benchmark <manifest.json> <prompt> [max_tokens]\n");
     printf("  edgexpu compare <manifest.json> <prompt>\n");
     printf("  edgexpu trace <manifest.json> <prompt>\n");
     printf("  edgexpu inspect-gguf <model.gguf>\n");
     printf("  edgexpu tokenize <manifest.json> <text>\n");
+    printf("  edgexpu dump-logits <manifest.json|model.gguf> <prompt> [n]\n");
     printf("  edgexpu executor-selftest\n");
     printf("  edgexpu scheduler-selftest\n");
     printf("  edgexpu native-selftest [model.gguf]\n");
     printf("  edgexpu serve <manifest.json> [port]\n");
 }
 
+/* 把 compare/benchmark 的文本安全写进 JSON 字符串。 */
 static void json_escape(const char *input, char *output, size_t output_size) {
     size_t used = 0;
 
@@ -228,12 +231,20 @@ static void print_executor_trace_table(const edgexpu_executor *executor) {
     }
 }
 
-static int command_benchmark(const char *manifest_path, const char *prompt) {
+/* 一次 generate 并打印 JSON telemetry / executor_trace。
+ * prefill/decode tok/s 用分项时间，不用整段 elapsed。 */
+static int command_benchmark(const char *manifest_path, const char *prompt, int max_tokens) {
     edgexpu_runtime runtime;
     edgexpu_generation_request request;
     edgexpu_generation_result result;
-    char escaped_text[EDGEXPU_TEXT_LARGE * 2];
+    char escaped_text[EDGEXPU_TEXT_PROMPT * 2];
     char error[256] = {0};
+    double prefill_tps;
+    double decode_tps;
+
+    if (max_tokens < 1) {
+        max_tokens = 8;
+    }
 
     edgexpu_runtime_init(&runtime);
     if (!edgexpu_runtime_load_model(&runtime, manifest_path, error, sizeof(error))) {
@@ -242,9 +253,11 @@ static int command_benchmark(const char *manifest_path, const char *prompt) {
         return 1;
     }
 
+    memset(&request, 0, sizeof(request));
     request.prompt = prompt;
-    request.max_tokens = 8;
+    request.max_tokens = max_tokens;
     request.temperature = 0.0f;
+    request.top_p = 1.0f;
     request.cpu_path = EDGEXPU_CPU_PATH_AUTO;
 
     if (!edgexpu_runtime_generate(&runtime, &request, &result, error, sizeof(error))) {
@@ -253,16 +266,23 @@ static int command_benchmark(const char *manifest_path, const char *prompt) {
         return 1;
     }
 
+    prefill_tps = result.telemetry.prefill_seconds > 0.0
+        ? (double)result.prompt_tokens_approx / result.telemetry.prefill_seconds
+        : 0.0;
+    decode_tps = result.telemetry.decode_seconds > 0.0
+        ? (double)result.completion_tokens_approx / result.telemetry.decode_seconds
+        : 0.0;
+
     json_escape(result.text, escaped_text, sizeof(escaped_text));
     printf("{\n");
     printf("  \"backend\": \"%s\",\n", result.backend);
+    printf("  \"finish_reason\": \"%s\",\n", result.finish_reason[0] != '\0' ? result.finish_reason : "stop");
+    printf("  \"max_tokens\": %d,\n", max_tokens);
     printf("  \"elapsed_seconds\": %.6f,\n", result.elapsed_seconds);
     printf("  \"prompt_tokens_approx\": %d,\n", result.prompt_tokens_approx);
     printf("  \"completion_tokens_approx\": %d,\n", result.completion_tokens_approx);
-    printf("  \"prefill_tokens_per_second_approx\": %.6f,\n",
-           result.elapsed_seconds > 0.0 ? result.prompt_tokens_approx / result.elapsed_seconds : 0.0);
-    printf("  \"decode_tokens_per_second_approx\": %.6f,\n",
-           result.elapsed_seconds > 0.0 ? result.completion_tokens_approx / result.elapsed_seconds : 0.0);
+    printf("  \"prefill_tokens_per_second_approx\": %.6f,\n", prefill_tps);
+    printf("  \"decode_tokens_per_second_approx\": %.6f,\n", decode_tps);
     printf("  \"stage_trace\": [\n");
     printf("    {\"stage\": \"prefill\", \"tokens_approx\": %d},\n", result.prompt_tokens_approx);
     printf("    {\"stage\": \"decode\", \"tokens_approx\": %d}\n", result.completion_tokens_approx);
@@ -279,8 +299,56 @@ static int command_benchmark(const char *manifest_path, const char *prompt) {
     return 0;
 }
 
+static int command_generate(const char *manifest_path, const char *prompt, int max_tokens) {
+    edgexpu_runtime runtime;
+    edgexpu_generation_request request;
+    edgexpu_generation_result result;
+    char error[256] = {0};
+    size_t text_len;
+
+    if (max_tokens < 1) {
+        max_tokens = 32;
+    }
+
+    edgexpu_runtime_init(&runtime);
+    if (!edgexpu_runtime_load_model(&runtime, manifest_path, error, sizeof(error))) {
+        fprintf(stderr, "模型加载失败：%s\n", error);
+        edgexpu_runtime_shutdown(&runtime);
+        return 1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.prompt = prompt;
+    request.max_tokens = max_tokens;
+    request.temperature = 0.0f;
+    request.top_p = 1.0f;
+    request.cpu_path = EDGEXPU_CPU_PATH_AUTO;
+
+    if (!edgexpu_runtime_generate(&runtime, &request, &result, error, sizeof(error))) {
+        fprintf(stderr, "generate 失败：%s\n", error);
+        edgexpu_runtime_shutdown(&runtime);
+        return 1;
+    }
+
+    fputs(result.text, stdout);
+    text_len = strlen(result.text);
+    if (text_len == 0 || result.text[text_len - 1] != '\n') {
+        fputc('\n', stdout);
+    }
+    fprintf(
+        stderr,
+        "finish_reason=%s backend=%s prompt_tokens=%d completion_tokens=%d\n",
+        result.finish_reason[0] != '\0' ? result.finish_reason : "stop",
+        result.backend,
+        result.prompt_tokens_approx,
+        result.completion_tokens_approx
+    );
+    edgexpu_runtime_shutdown(&runtime);
+    return 0;
+}
+
 static void print_compare_leg(const char *name, const edgexpu_generation_result *result) {
-    char escaped_text[EDGEXPU_TEXT_LARGE * 2];
+    char escaped_text[EDGEXPU_TEXT_PROMPT * 2];
     double total;
     double decode_tps;
 
@@ -302,6 +370,7 @@ static void print_compare_leg(const char *name, const edgexpu_generation_result 
     printf("  }");
 }
 
+/* 同模型对比 native CPU fallback 与 llama bootstrap。 */
 static int command_compare(const char *manifest_path, const char *prompt) {
     edgexpu_runtime runtime;
     edgexpu_generation_request request;
@@ -368,7 +437,7 @@ static int command_compare(const char *manifest_path, const char *prompt) {
     printf("    \"completion_tokens_native\": %d,\n", native_result.completion_tokens_approx);
     printf("    \"completion_tokens_llama\": %d,\n", llama_result.completion_tokens_approx);
     printf("    \"texts_required_to_match\": false,\n");
-    printf("    \"notes\": \"Phase 3 same-model CPU fallback vs llama.cpp shell-out. Token texts are not required to match.\"\n");
+    printf("    \"notes\": \"Same GGUF greedy check is edgexpu dump-logits vs llama-cli --temp 0 --no-conversation. compare still shells out llama with chat wrapping.\"\n");
     printf("  }\n");
     printf("}\n");
 
@@ -376,11 +445,13 @@ static int command_compare(const char *manifest_path, const char *prompt) {
     return 0;
 }
 
+/* 人类可读的 executor / scheduler / telemetry 表。 */
 static int command_trace(const char *manifest_path, const char *prompt) {
     edgexpu_runtime runtime;
     edgexpu_generation_request request;
     edgexpu_generation_result result;
     edgexpu_schedule_decision next_decode;
+    edgexpu_schedule_native_ready native_ready;
     char error[256] = {0};
 
     edgexpu_runtime_init(&runtime);
@@ -390,6 +461,7 @@ static int command_trace(const char *manifest_path, const char *prompt) {
         return 1;
     }
 
+    memset(&request, 0, sizeof(request));
     request.prompt = prompt;
     request.max_tokens = 4;
     request.temperature = 0.0f;
@@ -410,11 +482,19 @@ static int command_trace(const char *manifest_path, const char *prompt) {
     print_backend_telemetry_table(&result.telemetry);
     print_executor_trace_table(&runtime.executor);
 
+    memset(&native_ready, 0, sizeof(native_ready));
+    if (runtime.native.loaded) {
+        native_ready.loader = 1;
+        native_ready.tokenizer = runtime.native.tokenizer.ready;
+        native_ready.kernel = 1;
+        native_ready.kv = runtime.native.kv.k != NULL;
+    }
+
     if (edgexpu_scheduler_plan_job_with_context(
             &runtime.manifest,
             runtime.has_device_profile ? &runtime.device_profile : NULL,
             runtime.has_last_telemetry ? &runtime.last_telemetry : NULL,
-            NULL,
+            &native_ready,
             EDGEXPU_EXECUTOR_JOB_DECODE_STEP,
             &next_decode,
             error,
@@ -610,6 +690,46 @@ static int command_scheduler_selftest(void) {
             fprintf(stderr, "scheduler selftest failed: native tokenizer policy mismatch\n");
             return 1;
         }
+        native_ready.kernel = 1;
+        if (!edgexpu_scheduler_plan_job_with_context(
+                &manifest,
+                NULL,
+                NULL,
+                &native_ready,
+                EDGEXPU_EXECUTOR_JOB_PREFILL,
+                &decision,
+                error,
+                sizeof(error))) {
+            fprintf(stderr, "scheduler selftest failed: native prefill plan failed: %s\n", error);
+            return 1;
+        }
+        if (strcmp(decision.backend, "cpu.native") != 0 ||
+            strcmp(decision.policy, "native_prefill") != 0) {
+            fprintf(stderr, "scheduler selftest failed: native prefill policy mismatch backend=%s policy=%s\n",
+                    decision.backend,
+                    decision.policy);
+            return 1;
+        }
+        snprintf(telemetry.backend, sizeof(telemetry.backend), "cpu.native");
+        if (!edgexpu_scheduler_plan_job_with_context(
+                &manifest,
+                NULL,
+                &telemetry,
+                &native_ready,
+                EDGEXPU_EXECUTOR_JOB_DECODE_STEP,
+                &decision,
+                error,
+                sizeof(error))) {
+            fprintf(stderr, "scheduler selftest failed: native decode telemetry plan failed: %s\n", error);
+            return 1;
+        }
+        if (strcmp(decision.backend, "cpu.native") != 0 ||
+            strcmp(decision.policy, "telemetry_keep_native") != 0) {
+            fprintf(stderr, "scheduler selftest failed: expected telemetry_keep_native got backend=%s policy=%s\n",
+                    decision.backend,
+                    decision.policy);
+            return 1;
+        }
     }
 
     printf("scheduler selftest passed\n");
@@ -631,6 +751,7 @@ static int command_inspect_gguf(const char *gguf_path) {
     return 0;
 }
 
+/* 对原文 encode/decode，不套 chat template，便于核对 vocab。 */
 static int command_tokenize(const char *manifest_path, const char *text) {
     edgexpu_model_manifest manifest;
     edgexpu_native_session session;
@@ -671,6 +792,45 @@ static int command_tokenize(const char *manifest_path, const char *text) {
         sizeof(decoded)
     );
     printf("decoded=%s\n", decoded);
+    edgexpu_native_free(&session);
+    return 0;
+}
+
+static int path_is_json(const char *path) {
+    size_t len;
+    if (path == NULL) {
+        return 0;
+    }
+    len = strlen(path);
+    return len >= 5 && strcmp(path + len - 5, ".json") == 0;
+}
+
+/* 原文 dump：token ids、layer0 算子、last hidden、lm_head top-k、greedy 前 N 个 token。 */
+static int command_dump_logits(const char *path, const char *prompt, int greedy_n) {
+    edgexpu_model_manifest manifest;
+    edgexpu_native_session session;
+    char error[256] = {0};
+    const char *gguf_path = path;
+
+    if (path_is_json(path)) {
+        if (!edgexpu_manifest_load(path, &manifest, error, sizeof(error))) {
+            fprintf(stderr, "manifest 读取失败：%s\n", error);
+            return 1;
+        }
+        gguf_path = manifest.primary_artifact.path;
+    }
+
+    edgexpu_native_init(&session);
+    if (!edgexpu_native_load(&session, gguf_path, error, sizeof(error))) {
+        fprintf(stderr, "dump-logits 加载失败：%s\n", error);
+        edgexpu_native_free(&session);
+        return 1;
+    }
+    if (!edgexpu_native_dump_logits(&session, prompt, greedy_n, 8, error, sizeof(error))) {
+        fprintf(stderr, "dump-logits 失败：%s\n", error);
+        edgexpu_native_free(&session);
+        return 1;
+    }
     edgexpu_native_free(&session);
     return 0;
 }
@@ -718,12 +878,40 @@ int main(int argc, char **argv) {
         return command_tokenize(argv[2], argv[3]);
     }
 
-    if (strcmp(argv[1], "benchmark") == 0) {
+    if (strcmp(argv[1], "dump-logits") == 0) {
+        int greedy_n = 8;
         if (argc < 4) {
             print_usage();
             return 1;
         }
-        return command_benchmark(argv[2], argv[3]);
+        if (argc >= 5) {
+            greedy_n = atoi(argv[4]);
+        }
+        return command_dump_logits(argv[2], argv[3], greedy_n);
+    }
+
+    if (strcmp(argv[1], "generate") == 0) {
+        int max_tokens = 32;
+        if (argc < 4) {
+            print_usage();
+            return 1;
+        }
+        if (argc >= 5) {
+            max_tokens = atoi(argv[4]);
+        }
+        return command_generate(argv[2], argv[3], max_tokens);
+    }
+
+    if (strcmp(argv[1], "benchmark") == 0) {
+        int max_tokens = 8;
+        if (argc < 4) {
+            print_usage();
+            return 1;
+        }
+        if (argc >= 5) {
+            max_tokens = atoi(argv[4]);
+        }
+        return command_benchmark(argv[2], argv[3], max_tokens);
     }
 
     if (strcmp(argv[1], "compare") == 0) {

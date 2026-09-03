@@ -9,6 +9,14 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
+
+/* 把一次 generate 拆成 executor job。tokenize 前套模型包 chat template，
+ * native 与 llama bootstrap 共用格式化后的 prompt。
+ */
+
 #define EDGEXPU_GENERATE_JOB_RESERVE 64
 
 static int cpu_path_is_llama(const edgexpu_generation_request *request) {
@@ -33,7 +41,7 @@ typedef struct generation_job_context {
     const edgexpu_generation_request *request;
     edgexpu_generation_request local_request;
     edgexpu_generation_result *result;
-    char formatted_prompt[EDGEXPU_TEXT_LARGE];
+    char formatted_prompt[EDGEXPU_TEXT_PROMPT];
     char last_piece[EDGEXPU_TEXT_SMALL];
     int decode_stopped;
     int decode_index;
@@ -124,11 +132,33 @@ static void copy_replay_token(char *output, size_t output_size, const char *toke
     }
 
     if (token_index > 0 && token != NULL && token[0] != '\0' && (unsigned char)token[0] < 0x80) {
-        snprintf(output, output_size, " %s", token);
+        size_t copy_len;
+        if (output_size < 2) {
+            output[0] = '\0';
+            return;
+        }
+        copy_len = strlen(token);
+        if (copy_len > output_size - 2) {
+            copy_len = output_size - 2;
+        }
+        output[0] = ' ';
+        memcpy(output + 1, token, copy_len);
+        output[1 + copy_len] = '\0';
         return;
     }
 
-    snprintf(output, output_size, "%s", token != NULL ? token : "");
+    if (token == NULL) {
+        output[0] = '\0';
+        return;
+    }
+    {
+        size_t copy_len = strlen(token);
+        if (copy_len > output_size - 1) {
+            copy_len = output_size - 1;
+        }
+        memcpy(output, token, copy_len);
+        output[copy_len] = '\0';
+    }
 }
 
 static int run_scheduled_job_ex(
@@ -226,6 +256,44 @@ static int run_scheduled_job(
     );
 }
 
+static int bytes_to_mb(size_t bytes) {
+    return (int)(bytes / (1024u * 1024u));
+}
+
+static void set_finish_reason(edgexpu_generation_result *result, const char *reason) {
+    if (result == NULL) {
+        return;
+    }
+    snprintf(result->finish_reason, sizeof(result->finish_reason), "%s", reason != NULL ? reason : "stop");
+}
+
+static int prefetch_job_callback(
+    edgexpu_executor_job *job,
+    void *user_data,
+    char *error,
+    size_t error_size
+) {
+    generation_job_context *context = (generation_job_context *)user_data;
+    edgexpu_native_session *native;
+
+    (void)job;
+    (void)error;
+    (void)error_size;
+    if (context == NULL || context->runtime == NULL) {
+        return 1;
+    }
+    native = &context->runtime->native;
+    if (native->file_map == NULL || native->file_map_size == 0) {
+        return 1;
+    }
+#if defined(POSIX_MADV_WILLNEED)
+    (void)posix_madvise((void *)native->file_map, native->file_map_size, POSIX_MADV_WILLNEED);
+#elif defined(MADV_WILLNEED)
+    (void)madvise((void *)native->file_map, native->file_map_size, MADV_WILLNEED);
+#endif
+    return 1;
+}
+
 static int noop_job_callback(
     edgexpu_executor_job *job,
     void *user_data,
@@ -271,6 +339,7 @@ static int load_model_job_callback(
     return 1;
 }
 
+/* prompt 已由 generate_stream 套过 chat template。CLI tokenize 不走这条路径。 */
 static int tokenize_job_callback(
     edgexpu_executor_job *job,
     void *user_data,
@@ -288,6 +357,7 @@ static int tokenize_job_callback(
     return edgexpu_native_tokenize(&context->runtime->native, prompt, error, error_size);
 }
 
+/* llama 路径只占 KV 槽位；native 路径跑全层 prefill。 */
 static int prefill_job_callback(
     edgexpu_executor_job *job,
     void *user_data,
@@ -297,6 +367,7 @@ static int prefill_job_callback(
     generation_job_context *context = (generation_job_context *)user_data;
     edgexpu_runtime *runtime;
     int tokens;
+    int n_new;
 
     (void)job;
     if (context == NULL || context->runtime == NULL) {
@@ -306,15 +377,18 @@ static int prefill_job_callback(
     if (!runtime->native.loaded || runtime->native.kv.k == NULL) {
         return 1;
     }
-    if (!cpu_path_is_llama(context->request) && runtime->native.output_norm != NULL) {
-        return edgexpu_native_forward_prefill(&runtime->native, error, error_size);
-    }
     tokens = runtime->native.token_count;
     if (tokens < 0) {
         tokens = 0;
     }
-    if (tokens > runtime->native.kv.max_seq) {
-        tokens = runtime->native.kv.max_seq;
+    n_new = context->request != NULL && context->request->max_tokens > 0
+        ? context->request->max_tokens
+        : 1;
+    if (!edgexpu_native_ensure_window(&runtime->native, tokens, n_new, error, error_size)) {
+        return 0;
+    }
+    if (!cpu_path_is_llama(context->request) && runtime->native.output_norm != NULL) {
+        return edgexpu_native_forward_prefill(&runtime->native, error, error_size);
     }
     return edgexpu_native_reserve_kv(&runtime->native, tokens, error, error_size);
 }
@@ -331,8 +405,6 @@ static int update_kv_job_callback(
     int room;
 
     (void)job;
-    (void)error;
-    (void)error_size;
     if (context == NULL || context->runtime == NULL || !context->runtime->native.loaded) {
         return 1;
     }
@@ -341,22 +413,39 @@ static int update_kv_job_callback(
         return 1;
     }
     extra = context->result != NULL ? context->result->completion_tokens_approx : 1;
-    if (context->runtime->native.generated_tokens > 0) {
+    if (context->runtime->native.generated_tokens > 0 ||
+        native_decode_ready(&context->runtime->native)) {
+        if (cache->seq_len > cache->max_seq) {
+            snprintf(
+                error,
+                error_size,
+                "KV 超出窗口：seq_len=%d > max_seq=%d",
+                cache->seq_len,
+                cache->max_seq
+            );
+            return 0;
+        }
         return 1;
     }
     if (extra < 1) {
         extra = 1;
     }
     room = cache->max_seq - cache->seq_len;
-    if (room <= 0) {
-        return 1;
-    }
     if (extra > room) {
-        extra = room;
+        snprintf(
+            error,
+            error_size,
+            "KV 超出窗口：seq_len=%d + %d > max_seq=%d",
+            cache->seq_len,
+            extra,
+            cache->max_seq
+        );
+        return 0;
     }
     return edgexpu_kv_cache_extend(cache, extra, error, error_size);
 }
 
+/* native 就绪则 generate_next；否则只记完成 token 数，文本由 llama 路径回填。 */
 static int decode_job_callback(
     edgexpu_executor_job *job,
     void *user_data,
@@ -368,6 +457,7 @@ static int decode_job_callback(
     uint32_t token = 0;
     int stopped = 0;
     float temperature = 0.0f;
+    float top_p = 1.0f;
     size_t used;
 
     (void)job;
@@ -381,6 +471,7 @@ static int decode_job_callback(
     if (!cpu_path_is_llama(context->request) && native_decode_ready(native)) {
         if (context->request != NULL) {
             temperature = context->request->temperature;
+            top_p = context->request->top_p;
         }
         if (context->result != NULL && context->result->backend[0] == '\0') {
             snprintf(context->result->backend, sizeof(context->result->backend), "cpu.native");
@@ -389,6 +480,7 @@ static int decode_job_callback(
         if (!edgexpu_native_generate_next(
                 native,
                 temperature,
+                top_p,
                 &token,
                 context->last_piece,
                 sizeof(context->last_piece),
@@ -710,13 +802,21 @@ int edgexpu_runtime_generate_stream(
     generation_context.formatted_prompt[0] = '\0';
     generation_context.decode_stopped = 0;
     generation_context.decode_index = 0;
+    /* 优先模型包简化模板；没有 {{prompt}} / {{#message}} 的 GGUF Jinja 不会被执行。 */
     if (request != NULL) {
         const char *template_text = runtime->manifest.chat_template;
         if (template_text[0] == '\0') {
             template_text = runtime->native.gguf.chat_template;
         }
         generation_context.local_request = *request;
-        if (!edgexpu_chat_apply(
+        if (request->prompt_is_formatted) {
+            snprintf(
+                generation_context.formatted_prompt,
+                sizeof(generation_context.formatted_prompt),
+                "%s",
+                request->prompt != NULL ? request->prompt : ""
+            );
+        } else if (!edgexpu_chat_apply(
                 template_text,
                 request->prompt != NULL ? request->prompt : "",
                 generation_context.formatted_prompt,
@@ -751,14 +851,24 @@ int edgexpu_runtime_generate_stream(
         return 0;
     }
 
-    if (!run_scheduled_job(
-            runtime,
-            EDGEXPU_EXECUTOR_JOB_PREFETCH_WEIGHTS,
-            noop_job_callback,
-            NULL,
-            error,
-            error_size)) {
-        return 0;
+    {
+        char prefetch_detail[EDGEXPU_TEXT_MEDIUM];
+        snprintf(
+            prefetch_detail,
+            sizeof(prefetch_detail),
+            "madvise WILLNEED mmap_bytes=%zu (not flash paging)",
+            runtime->native.file_map_size
+        );
+        if (!run_scheduled_job_ex(
+                runtime,
+                EDGEXPU_EXECUTOR_JOB_PREFETCH_WEIGHTS,
+                prefetch_detail,
+                prefetch_job_callback,
+                &generation_context,
+                error,
+                error_size)) {
+            return 0;
+        }
     }
 
     if (!run_scheduled_job(
@@ -829,6 +939,13 @@ int edgexpu_runtime_generate_stream(
                 error_size)) {
             return 0;
         }
+        if (generation_context.decode_stopped) {
+            set_finish_reason(result, "stop");
+        } else if (produced >= max_new) {
+            set_finish_reason(result, "length");
+        } else {
+            set_finish_reason(result, "stop");
+        }
         if (result != NULL) {
             result->elapsed_seconds = runtime_now_seconds() - started;
             if (result->backend[0] == '\0') {
@@ -840,7 +957,7 @@ int edgexpu_runtime_generate_stream(
             snprintf(
                 result->telemetry.fallback_reason,
                 sizeof(result->telemetry.fallback_reason),
-                "native token-by-token decode; not numerically aligned with llama.cpp"
+                "native token-by-token decode"
             );
             result->telemetry.prefill_seconds = runtime->native.prefill_seconds;
             result->telemetry.decode_seconds = result->elapsed_seconds;
@@ -848,8 +965,7 @@ int edgexpu_runtime_generate_stream(
                 result->telemetry.prefill_seconds + result->telemetry.decode_seconds;
             result->telemetry.prompt_tokens_approx = result->prompt_tokens_approx;
             result->telemetry.completion_tokens_approx = result->completion_tokens_approx;
-            result->telemetry.memory_used_mb =
-                (int)(edgexpu_kv_cache_bytes(&runtime->native.kv) / (1024u * 1024u));
+            result->telemetry.memory_used_mb = bytes_to_mb(edgexpu_native_memory_bytes(&runtime->native));
         }
     } else if (!run_scheduled_job(
             runtime,
@@ -869,14 +985,36 @@ int edgexpu_runtime_generate_stream(
         return 0;
     }
 
-    if (!run_scheduled_job(
-            runtime,
-            EDGEXPU_EXECUTOR_JOB_UPDATE_KV_CACHE,
-            update_kv_job_callback,
-            &generation_context,
-            error,
-            error_size)) {
-        return 0;
+    if (result != NULL && result->finish_reason[0] == '\0') {
+        int max_new = request != NULL && request->max_tokens > 0 ? request->max_tokens : 1;
+        if (result->completion_tokens_approx >= max_new) {
+            set_finish_reason(result, "length");
+        } else {
+            set_finish_reason(result, "stop");
+        }
+    }
+
+    {
+        char kv_detail[EDGEXPU_TEXT_MEDIUM];
+        snprintf(
+            kv_detail,
+            sizeof(kv_detail),
+            "seq_len=%d max_seq=%d kv_bytes=%zu mmap_bytes=%zu",
+            runtime->native.kv.seq_len,
+            runtime->native.kv.max_seq,
+            edgexpu_kv_cache_bytes(&runtime->native.kv),
+            runtime->native.file_map_size
+        );
+        if (!run_scheduled_job_ex(
+                runtime,
+                EDGEXPU_EXECUTOR_JOB_UPDATE_KV_CACHE,
+                kv_detail,
+                update_kv_job_callback,
+                &generation_context,
+                error,
+                error_size)) {
+            return 0;
+        }
     }
 
     if (!run_scheduled_job(

@@ -1,11 +1,14 @@
 #include "edgexpu/server.h"
 
+#include "edgexpu/chat.h"
 #include "edgexpu/runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* 最小 HTTP：解析 messages / model / max_tokens / stream，转给 runtime generate。 */
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -24,7 +27,7 @@ typedef int edgexpu_socket_t;
 #define edgexpu_close_socket close
 #endif
 
-#define EDGEXPU_HTTP_BUFFER 16384
+#define EDGEXPU_HTTP_BUFFER 32768
 
 static int sockets_init(void) {
 #if defined(_WIN32)
@@ -82,7 +85,6 @@ static void json_escape(const char *input, char *output, size_t output_size) {
 static int extract_json_string(const char *json, const char *key, char *output, size_t output_size) {
     char pattern[128];
     const char *cursor;
-    const char *match = NULL;
     char *writer;
     size_t remaining;
 
@@ -91,15 +93,11 @@ static int extract_json_string(const char *json, const char *key, char *output, 
     }
 
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    cursor = json;
-    while ((cursor = strstr(cursor, pattern)) != NULL) {
-        match = cursor;
-        cursor += strlen(pattern);
-    }
-    if (match == NULL) {
+    cursor = strstr(json, pattern);
+    if (cursor == NULL) {
         return 0;
     }
-    cursor = strchr(match + strlen(pattern), ':');
+    cursor = strchr(cursor + strlen(pattern), ':');
     if (cursor == NULL) {
         return 0;
     }
@@ -227,9 +225,10 @@ static void send_chat_response(
     const edgexpu_runtime *runtime,
     const edgexpu_generation_result *result
 ) {
-    char escaped_text[EDGEXPU_TEXT_LARGE * 2];
-    char body[EDGEXPU_TEXT_LARGE * 2 + 1024];
+    char escaped_text[EDGEXPU_TEXT_PROMPT * 2];
+    char body[EDGEXPU_TEXT_PROMPT * 2 + 1024];
     long created = (long)time(NULL);
+    const char *finish = result->finish_reason[0] != '\0' ? result->finish_reason : "stop";
 
     json_escape(result->text, escaped_text, sizeof(escaped_text));
     snprintf(
@@ -240,12 +239,13 @@ static void send_chat_response(
         "\"object\":\"chat.completion\","
         "\"created\":%ld,"
         "\"model\":\"%s\","
-        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"%s\"}],"
         "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}"
         "}\n",
         created,
         runtime->manifest.model_id,
         escaped_text,
+        finish,
         result->prompt_tokens_approx,
         result->completion_tokens_approx,
         result->prompt_tokens_approx + result->completion_tokens_approx
@@ -295,16 +295,23 @@ static void send_stream_token_chunk(
     send_sse_chunk(client, event);
 }
 
-static void send_stream_finish_chunk(edgexpu_socket_t client, const char *model_id, long created) {
+static void send_stream_finish_chunk(
+    edgexpu_socket_t client,
+    const char *model_id,
+    long created,
+    const char *finish_reason
+) {
     char event[1024];
+    const char *finish = finish_reason != NULL && finish_reason[0] != '\0' ? finish_reason : "stop";
 
     snprintf(
         event,
         sizeof(event),
         "{\"id\":\"chatcmpl-edgexpu\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
-        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}",
         created,
-        model_id
+        model_id,
+        finish
     );
     send_sse_chunk(client, event);
 }
@@ -327,23 +334,167 @@ static void sse_on_token(const char *token, int token_index, int token_count, vo
     send_stream_token_chunk(state->client, state->model_id, state->created, token);
 }
 
+static int extract_string_in_range(
+    const char *begin,
+    const char *end,
+    const char *key,
+    char *output,
+    size_t output_size
+) {
+    char saved;
+    int ok;
+    char *mutable_end;
+
+    if (begin == NULL || end == NULL || begin >= end) {
+        return 0;
+    }
+    mutable_end = (char *)end;
+    saved = *mutable_end;
+    *mutable_end = '\0';
+    ok = extract_json_string(begin, key, output, output_size);
+    *mutable_end = saved;
+    return ok;
+}
+
+static int parse_chat_messages(
+    const char *body,
+    edgexpu_chat_message *messages,
+    char roles[][EDGEXPU_TEXT_SMALL],
+    char *pool,
+    size_t pool_size,
+    size_t *n_messages
+) {
+    const char *cursor;
+    const char *array;
+    size_t pool_used = 0;
+    size_t count = 0;
+
+    *n_messages = 0;
+    cursor = strstr(body, "\"messages\"");
+    if (cursor == NULL) {
+        return 0;
+    }
+    array = strchr(cursor + 10, '[');
+    if (array == NULL) {
+        return 0;
+    }
+    cursor = array + 1;
+    while (*cursor != '\0' && *cursor != ']' && count < EDGEXPU_CHAT_MAX_MESSAGES) {
+        const char *obj;
+        const char *obj_end;
+        int depth;
+        char role[EDGEXPU_TEXT_SMALL];
+        char content[EDGEXPU_TEXT_LARGE];
+        size_t content_len;
+
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r' || *cursor == ',') {
+            cursor++;
+        }
+        if (*cursor == ']' || *cursor == '\0') {
+            break;
+        }
+        if (*cursor != '{') {
+            cursor++;
+            continue;
+        }
+        obj = cursor;
+        depth = 0;
+        obj_end = cursor;
+        do {
+            if (*obj_end == '{') {
+                depth++;
+            } else if (*obj_end == '}') {
+                depth--;
+            }
+            obj_end++;
+        } while (*obj_end != '\0' && depth > 0);
+        if (depth != 0) {
+            return 0;
+        }
+        role[0] = '\0';
+        content[0] = '\0';
+        (void)extract_string_in_range(obj, obj_end, "role", role, sizeof(role));
+        if (!extract_string_in_range(obj, obj_end, "content", content, sizeof(content))) {
+            cursor = obj_end;
+            continue;
+        }
+        if (role[0] == '\0') {
+            snprintf(role, sizeof(role), "user");
+        }
+        content_len = strlen(content);
+        if (pool_used + content_len + 1 > pool_size) {
+            return 0;
+        }
+        memcpy(pool + pool_used, content, content_len + 1);
+        snprintf(roles[count], EDGEXPU_TEXT_SMALL, "%s", role);
+        messages[count].role = roles[count];
+        messages[count].content = pool + pool_used;
+        pool_used += content_len + 1;
+        count++;
+        cursor = obj_end;
+    }
+    *n_messages = count;
+    return count > 0;
+}
+
+/* 解析 messages（含 system / 多轮）并套模型包模板；校验 model。 */
 static void handle_chat_completion(edgexpu_socket_t client, edgexpu_runtime *runtime, const char *body) {
     edgexpu_generation_request request;
     edgexpu_generation_result result;
-    char prompt[EDGEXPU_TEXT_LARGE];
+    edgexpu_chat_message messages[EDGEXPU_CHAT_MAX_MESSAGES];
+    char roles[EDGEXPU_CHAT_MAX_MESSAGES][EDGEXPU_TEXT_SMALL];
+    char content_pool[EDGEXPU_TEXT_PROMPT];
+    char formatted[EDGEXPU_TEXT_PROMPT];
+    char model[EDGEXPU_TEXT_SMALL];
     char error[512] = {0};
+    const char *template_text;
+    size_t n_messages = 0;
     int temperature_milli;
+    int top_p_milli;
 
-    if (!extract_json_string(body, "content", prompt, sizeof(prompt))) {
-        send_error(client, 400, "Bad Request", "request body must include at least one message content");
+    if (extract_json_string(body, "model", model, sizeof(model)) &&
+        model[0] != '\0' &&
+        strcmp(model, runtime->manifest.model_id) != 0) {
+        send_error(client, 400, "Bad Request", "model does not match the loaded manifest");
+        return;
+    }
+
+    if (!parse_chat_messages(body, messages, roles, content_pool, sizeof(content_pool), &n_messages)) {
+        edgexpu_chat_message single;
+        if (!extract_json_string(body, "prompt", content_pool, sizeof(content_pool)) &&
+            !extract_json_string(body, "content", content_pool, sizeof(content_pool))) {
+            send_error(client, 400, "Bad Request", "request body must include messages or content");
+            return;
+        }
+        memset(&single, 0, sizeof(single));
+        single.role = "user";
+        single.content = content_pool;
+        messages[0] = single;
+        n_messages = 1;
+    }
+
+    template_text = runtime->manifest.chat_template;
+    if (template_text[0] == '\0') {
+        template_text = runtime->native.gguf.chat_template;
+    }
+    if (!edgexpu_chat_apply_conversation(
+            template_text,
+            messages,
+            n_messages,
+            formatted,
+            sizeof(formatted))) {
+        send_error(client, 400, "Bad Request", "chat template output is too long");
         return;
     }
 
     memset(&request, 0, sizeof(request));
-    request.prompt = prompt;
+    request.prompt = formatted;
+    request.prompt_is_formatted = 1;
     request.max_tokens = extract_json_int(body, "max_tokens", 128);
     temperature_milli = extract_json_float_milli(body, "temperature", 0);
     request.temperature = (float)temperature_milli / 1000.0f;
+    top_p_milli = extract_json_float_milli(body, "top_p", 1000);
+    request.top_p = (float)top_p_milli / 1000.0f;
 
     if (request_wants_stream(body)) {
         sse_stream_state stream_state;
@@ -375,7 +526,7 @@ static void handle_chat_completion(edgexpu_socket_t client, edgexpu_runtime *run
             return;
         }
 
-        send_stream_finish_chunk(client, runtime->manifest.model_id, created);
+        send_stream_finish_chunk(client, runtime->manifest.model_id, created, result.finish_reason);
         send_sse_chunk(client, "[DONE]");
         return;
     }
@@ -388,25 +539,85 @@ static void handle_chat_completion(edgexpu_socket_t client, edgexpu_runtime *run
     send_chat_response(client, runtime, &result);
 }
 
+static int parse_http_content_length(const char *headers, size_t header_bytes, int *out_length) {
+    const char *cursor;
+    const char *end = headers + header_bytes;
+    char saved;
+    int value;
+
+    *out_length = -1;
+    saved = headers[header_bytes];
+    ((char *)headers)[header_bytes] = '\0';
+    cursor = strstr(headers, "Content-Length:");
+    if (cursor == NULL) {
+        cursor = strstr(headers, "content-length:");
+    }
+    ((char *)headers)[header_bytes] = saved;
+    (void)end;
+    if (cursor == NULL || cursor >= headers + header_bytes) {
+        return 1;
+    }
+    cursor += 15;
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    value = atoi(cursor);
+    if (value < 0) {
+        return 0;
+    }
+    *out_length = value;
+    return 1;
+}
+
 static void handle_client(edgexpu_socket_t client, edgexpu_runtime *runtime) {
     char buffer[EDGEXPU_HTTP_BUFFER + 1];
-    int received;
-    char *body;
+    int received = 0;
+    char *header_end;
+    const char *body;
+    size_t header_bytes;
+    int content_length = -1;
 
-    received = recv(client, buffer, EDGEXPU_HTTP_BUFFER, 0);
+    while (received < EDGEXPU_HTTP_BUFFER) {
+        int chunk = recv(client, buffer + received, EDGEXPU_HTTP_BUFFER - received, 0);
+        if (chunk <= 0) {
+            break;
+        }
+        received += chunk;
+        buffer[received] = '\0';
+        header_end = strstr(buffer, "\r\n\r\n");
+        if (header_end == NULL) {
+            continue;
+        }
+        header_bytes = (size_t)(header_end - buffer);
+        if (!parse_http_content_length(buffer, header_bytes, &content_length)) {
+            send_error(client, 400, "Bad Request", "invalid Content-Length");
+            return;
+        }
+        if (content_length < 0) {
+            break;
+        }
+        if (header_bytes + 4 + (size_t)content_length > (size_t)EDGEXPU_HTTP_BUFFER) {
+            send_error(client, 413, "Payload Too Large", "request body exceeds server buffer");
+            return;
+        }
+        if (received >= (int)header_bytes + 4 + content_length) {
+            break;
+        }
+    }
+
     if (received <= 0) {
         return;
     }
     buffer[received] = '\0';
 
-    body = strstr(buffer, "\r\n\r\n");
-    if (body == NULL) {
+    header_end = strstr(buffer, "\r\n\r\n");
+    if (header_end == NULL) {
         send_error(client, 400, "Bad Request", "invalid HTTP request");
         return;
     }
-    body += 4;
+    body = header_end + 4;
 
-    if (strncmp(buffer, "GET /v1/models ", 15) == 0) {
+    if (strncmp(buffer, "GET /v1/models ", 15) == 0 || strncmp(buffer, "GET /v1/models\r", 15) == 0) {
         char response[512];
         snprintf(
             response,
@@ -418,7 +629,8 @@ static void handle_client(edgexpu_socket_t client, edgexpu_runtime *runtime) {
         return;
     }
 
-    if (strncmp(buffer, "POST /v1/chat/completions ", 26) != 0) {
+    if (strncmp(buffer, "POST /v1/chat/completions ", 26) != 0 &&
+        strncmp(buffer, "POST /v1/chat/completions\r", 26) != 0) {
         send_error(client, 404, "Not Found", "only /v1/chat/completions and /v1/models are supported");
         return;
     }

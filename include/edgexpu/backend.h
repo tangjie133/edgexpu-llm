@@ -9,17 +9,23 @@
 extern "C" {
 #endif
 
+/* Backend 契约：可用性检查、加载 artifact、执行一次生成。
+ * cpu.native 由 runtime 内部 native session 实现；这里的 cpu.baseline 是 llama.cpp shell-out。
+ */
+
 typedef enum edgexpu_cpu_path {
-    EDGEXPU_CPU_PATH_AUTO = 0,
-    EDGEXPU_CPU_PATH_NATIVE = 1,
-    EDGEXPU_CPU_PATH_LLAMA_BOOTSTRAP = 2
+    EDGEXPU_CPU_PATH_AUTO = 0,           /* native 就绪则走 native，否则 llama bootstrap */
+    EDGEXPU_CPU_PATH_NATIVE = 1,         /* 强制 native CPU fallback */
+    EDGEXPU_CPU_PATH_LLAMA_BOOTSTRAP = 2 /* 强制临时 llama CLI */
 } edgexpu_cpu_path;
 
 typedef struct edgexpu_generation_request {
     const char *prompt;
     int max_tokens;
     float temperature;
+    float top_p; /* <=0 或 >=1 表示不截断；temperature≈0 时忽略，走 greedy */
     edgexpu_cpu_path cpu_path;
+    int prompt_is_formatted; /* HTTP 已按 messages 套模板，runtime 不再套一层 */
 } edgexpu_generation_request;
 
 typedef struct edgexpu_backend_telemetry {
@@ -31,12 +37,13 @@ typedef struct edgexpu_backend_telemetry {
     double decode_seconds;
     int prompt_tokens_approx;
     int completion_tokens_approx;
-    int memory_used_mb;
+    int memory_used_mb; /* mmap 权重大小 + KV，向上取整到 MB */
 } edgexpu_backend_telemetry;
 
 typedef struct edgexpu_generation_result {
-    char text[EDGEXPU_TEXT_LARGE];
+    char text[EDGEXPU_TEXT_PROMPT];
     char backend[EDGEXPU_TEXT_SMALL];
+    char finish_reason[EDGEXPU_TEXT_SMALL]; /* stop | length */
     double elapsed_seconds;
     int prompt_tokens_approx;
     int completion_tokens_approx;

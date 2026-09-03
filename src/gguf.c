@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* GGUF v3：读魔数、KV metadata、tensor 目录；可选加载 GPT-2 vocab/merges。 */
+
 enum {
     GGUF_U8 = 0,
     GGUF_I8 = 1,
@@ -201,6 +203,7 @@ const edgexpu_gguf_tensor *edgexpu_gguf_find_tensor(
     return NULL;
 }
 
+/* 顺序读 header → KV（含 architecture / tokenizer / chat_template）→ tensor 表 → 对齐 data_offset。 */
 int edgexpu_gguf_load(
     const char *path,
     edgexpu_gguf_info *info,
@@ -400,6 +403,7 @@ int edgexpu_gguf_load(
         tokenizer->eos_token_id = info->eos_token_id;
         tokenizer->pad_token_id = info->pad_token_id;
         tokenizer->add_bos_token = info->add_bos_token;
+        snprintf(tokenizer->pre, sizeof(tokenizer->pre), "%s", info->tokenizer_pre);
         if (!edgexpu_tokenizer_build_index(tokenizer, error, error_size)) {
             return 0;
         }

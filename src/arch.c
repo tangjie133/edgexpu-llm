@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* 按 GGUF general.architecture 选择 RoPE / bias / FFN / tokenizer。
+ * 新增架构时在这里加 adapter，不要改 native.c 默认成某一个模型。
+ */
+
 static void set_error(char *error, size_t error_size, const char *message) {
     if (error != NULL && error_size > 0) {
         snprintf(error, error_size, "%s", message);

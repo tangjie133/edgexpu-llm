@@ -13,6 +13,10 @@
 extern "C" {
 #endif
 
+/* Runtime 门面：持有 manifest、native session、executor 和最近一次 telemetry。
+ * generate 按 scheduler 提交 job；tokenize 前套用模型包 chat template。
+ */
+
 typedef struct edgexpu_runtime {
     edgexpu_model_manifest manifest;
     edgexpu_device_profile device_profile;
@@ -29,7 +33,7 @@ typedef struct edgexpu_runtime {
 void edgexpu_runtime_init(edgexpu_runtime *runtime);
 void edgexpu_runtime_shutdown(edgexpu_runtime *runtime);
 
-/* 加载 manifest 并选择 backend。 */
+/* 加载 manifest 并选择 backend。GGUF 同时尝试 native_load。 */
 int edgexpu_runtime_load_model(
     edgexpu_runtime *runtime,
     const char *manifest_path,

@@ -130,9 +130,9 @@ collectTelemetry
 
 ### Raspberry Pi / ARM CPU Fallback
 
-Raspberry Pi 是早期没有 Rockchip 或 Qualcomm 板子时的验证平台。它用于验证离线运行结构、GGUF 模型路径、本地 API、benchmark trace、manifest 加载和 CPU fallback 行为。
+Raspberry Pi 是早期没有 Rockchip 或 Qualcomm 板子时的验证平台。它用于验证离线运行结构、GGUF 模型路径、本地 API、benchmark trace、manifest 加载和 CPU fallback 行为（ARM/NEON 正确性、内存、存储 mmap）。
 
-它不验证生产级 NPU 调度，也不验证 vendor runtime 兼容性。
+它不验证生产级 NPU 调度，也不拿相对 llama.cpp 的 tok/s 当验收。CPU 对照与差距标准见 `README.plan.zh.md`「CPU fallback 验收标准」。
 
 ### Rockchip RK3588 / RK3576
 
@@ -243,113 +243,56 @@ MVP 要保持小而可验证。
 - 模型转换 pipeline
 - distributed serving
 
-## 构建和运行
-
-配置并构建：
+## 构建和验证
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
-```
-
-运行 MVP 验证脚本：
-
-```bash
 bash scripts/verify_mvp.sh
 ```
 
-Windows 用户可以参考：
+日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。数值锁在 `scripts/verify.locks`。
 
-```text
-docs/windows-mingw-setup.md
-```
-
-查看本机能力：
+llama.cpp 只是可选对照，不进默认验证：
 
 ```bash
-./build/edgexpu capabilities
+bash scripts/align_llama.sh              # greedy id vs llama-cli --no-conversation
+bash scripts/bench_cpu.sh                # 公平 CPU tok/s，n=32，隐藏 GPU
+./build/edgexpu generate <manifest> "<prompt>" 32   # 纯文本；finish_reason 打在 stderr
+./build/edgexpu compare <manifest> <prompt>   # 临时 bootstrap 耗时对比，会 shell-out
+./build/edgexpu benchmark <manifest> "<prompt>" 32
 ```
 
-查看模型 manifest：
+Phase 3.3 ARM / NEON（不进 `verify_mvp.sh`，无相对 llama 的 tok/s 线）：
 
 ```bash
-./build/edgexpu inspect-manifest examples/models/qwen2.5-0.5b/model.manifest.json
+sudo apt install gcc-aarch64-linux-gnu qemu-user-static   # 仅 x86 交叉编译需要
+bash scripts/verify_arm.sh                                # 交叉编译 + qemu unit；板上直接跑 greedy 锁点
+# EDGEXPU_ARM_FULL=1 bash scripts/verify_arm.sh           # x86 上 qemu 跑参考包 greedy（慢）
+# 树莓派 5 本机构建再加：-DEDGEXPU_ARM_DOTPROD=ON
 ```
 
-运行 benchmark：
+调试 native 前向（默认 greedy n=8；锁点用 n=4）：
 
 ```bash
-./build/edgexpu benchmark examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
+./build/edgexpu dump-logits examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf "Hello EdgeXPU" 4
 ```
 
-同模型对比 native CPU fallback 与 llama bootstrap：
-
-```bash
-./build/edgexpu compare examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
-```
-
-查看 executor trace：
-
-```bash
-./build/edgexpu trace examples/models/qwen2.5-0.5b/model.manifest.json "Explain EdgeXPU-LLM briefly."
-```
-
-运行 executor 自测：
-
-```bash
-./build/edgexpu executor-selftest
-```
-
-运行 scheduler 自测：
-
-```bash
-./build/edgexpu scheduler-selftest
-```
-
-查看 GGUF 元数据和 native tokenizer：
-
-```bash
-./build/edgexpu inspect-gguf examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf
-./build/edgexpu tokenize examples/models/qwen2.5-0.5b/model.manifest.json "Hello EdgeXPU"
-./build/edgexpu native-selftest examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf
-./build/edgexpu inspect-gguf examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf
-./build/edgexpu tokenize examples/models/smollm2-135m/model.manifest.json "Hello EdgeXPU"
-```
-
-启动本地 API server：
+本地 API：
 
 ```bash
 ./build/edgexpu serve examples/models/qwen2.5-0.5b/model.manifest.json 8000
-```
-
-列出模型：
-
-```bash
 curl http://127.0.0.1:8000/v1/models
-```
-
-运行 chat completion：
-
-```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @examples/requests/chat_completion.json
 ```
 
-临时 CPU bootstrap backend 需要 `PATH` 中存在以下命令之一，也可以在 manifest 里指定：
+Windows 用户可以参考 `docs/windows-mingw-setup.md`。
 
-- `llama`
-- `llama-cli`
-- `powerinfer`
-- `main`
+其它 CLI（`capabilities`、`benchmark`、`trace`、自测）见 `./build/edgexpu` 无参数帮助。
 
-如果使用新版 llama.cpp distribution，manifest 中设置：
-
-```json
-"command": "llama"
-```
-
-runtime 会在内部调用 `llama cli`。
+`llama` / `llama-cli` 仅在显式跑 `compare` 或 `align_llama.sh` 时需要。
 
 ## 计划与设计记录
 

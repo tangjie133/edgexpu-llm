@@ -13,6 +13,7 @@
   ],
   "properties": {
     "model_id": { "type": "string" },
+    "name": { "type": "string" },
     "family": { "type": "string" },
     "parameter_size": { "type": "string" },
     "context_length": { "type": "integer", "minimum": 1 },
@@ -23,9 +24,10 @@
     },
     "memory_required_mb": { "type": ["integer", "null"], "minimum": 1 },
     "kv_cache_required_mb": { "type": ["integer", "null"], "minimum": 1 },
+    "chat_template": { "type": "string" },
     "fallback_policy": {
       "type": "string",
-      "enum": ["cpu.baseline", "cpu.llama_cpp", "rockchip.rkllm", "qualcomm.qnn"]
+      "enum": ["cpu.native", "cpu.baseline", "cpu.llama_cpp", "rockchip.rkllm", "qualcomm.qnn"]
     },
     "artifacts": {
       "type": "array",
@@ -36,7 +38,7 @@
         "properties": {
           "backend": {
             "type": "string",
-            "enum": ["cpu.baseline", "cpu.llama_cpp", "rockchip.rkllm", "qualcomm.qnn"]
+            "enum": ["cpu.native", "cpu.baseline", "cpu.llama_cpp", "rockchip.rkllm", "qualcomm.qnn"]
           },
           "path": { "type": "string" },
           "format": { "type": "string" },

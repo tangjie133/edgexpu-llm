@@ -1,3 +1,4 @@
+#include "edgexpu/cpu_kernel.h"
 #include "edgexpu/profiler.h"
 
 #include <stdio.h>
@@ -15,7 +16,7 @@
 /* profiler 是调度器的输入来源。初版先回答“当前机器大概是什么、有什么 runtime”。 */
 
 static int command_exists(const char *command) {
-    char check_command[256];
+    char check_command[EDGEXPU_TEXT_MEDIUM + 64];
 #if defined(_WIN32)
     char line[512];
     FILE *pipe;
@@ -87,6 +88,10 @@ int edgexpu_profile_device(edgexpu_device_profile *profile) {
     profile->has_llama_cli = command_exists("llama-cli") || command_exists("powerinfer") || command_exists("main");
     profile->has_rockchip_runtime = command_exists("rkllm");
     profile->has_qualcomm_runtime = command_exists("qnn-net-run");
+    snprintf(profile->simd, sizeof(profile->simd), "%s", edgexpu_cpu_simd_name());
+    profile->emulated =
+        getenv("EDGEXPU_EMULATED") != NULL ||
+        getenv("QEMU_LD_PREFIX") != NULL;
     return 1;
 }
 
@@ -100,6 +105,8 @@ void edgexpu_profile_print_json(const edgexpu_device_profile *profile) {
     printf("  \"arch\": \"%s\",\n", profile->arch);
     printf("  \"cpu_count\": %d,\n", profile->cpu_count);
     printf("  \"memory_total_mb\": %d,\n", profile->memory_total_mb);
+    printf("  \"simd\": \"%s\",\n", profile->simd);
+    printf("  \"emulated\": %s,\n", profile->emulated ? "true" : "false");
     printf("  \"runtimes\": {\n");
     printf("    \"cpu_baseline\": %s,\n", profile->has_llama_cli ? "true" : "false");
     printf("    \"rockchip\": %s,\n", profile->has_rockchip_runtime ? "true" : "false");

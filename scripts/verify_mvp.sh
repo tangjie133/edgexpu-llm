@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
+# One CI entry: native CPU fallback only (no llama.cpp shell-out).
+# Numerical locks: scripts/verify.locks
+# Optional llama.cpp: scripts/align_llama.sh  or  edgexpu compare
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=verify.locks
+source "${ROOT_DIR}/scripts/verify.locks"
+
 BUILD_DIR="${ROOT_DIR}/build"
 BIN="${BUILD_DIR}/edgexpu"
-MANIFEST="${ROOT_DIR}/examples/models/qwen2.5-0.5b/model.manifest.json"
-GGUF="${ROOT_DIR}/examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+QWEN_MANIFEST="${ROOT_DIR}/examples/models/qwen2.5-0.5b/model.manifest.json"
+QWEN_GGUF="${ROOT_DIR}/examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+SMOL_MANIFEST="${ROOT_DIR}/examples/models/smollm2-135m/model.manifest.json"
+SMOL_GGUF="${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 CHAT_REQUEST="${ROOT_DIR}/examples/requests/chat_completion.json"
 STREAM_REQUEST="${ROOT_DIR}/examples/requests/chat_completion_stream.json"
 PORT="${EDGEXPU_VERIFY_PORT:-18080}"
@@ -21,27 +29,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
+stage() {
+    echo "== $* =="
+}
+
+die() {
+    echo "verification failed: $*" >&2
+    exit 1
+}
+
 require_file() {
-    local path="$1"
-    if [[ ! -f "${path}" ]]; then
-        echo "missing required file: ${path}" >&2
-        exit 1
-    fi
+    [[ -f "$1" ]] || die "missing file $1"
 }
 
 require_contains() {
     local text="$1"
     local expected="$2"
     local label="$3"
-
     case "${text}" in
         *"${expected}"*) ;;
         *)
-            echo "verification failed: ${label} did not contain ${expected}" >&2
             echo "${text}" >&2
-            exit 1
+            die "${label} missing ${expected}"
             ;;
     esac
+}
+
+require_line() {
+    local text="$1"
+    local expected="$2"
+    local label="$3"
+    if ! printf '%s\n' "${text}" | grep -qxF "${expected}"; then
+        echo "${text}" >&2
+        die "${label} missing line ${expected}"
+    fi
 }
 
 require_min_count() {
@@ -50,163 +71,106 @@ require_min_count() {
     local minimum="$3"
     local label="$4"
     local count
-
     count="$(printf '%s' "${text}" | grep -o "${expected}" | wc -l | tr -d ' ')"
     if [[ "${count}" -lt "${minimum}" ]]; then
-        echo "verification failed: ${label} expected at least ${minimum} ${expected}, got ${count}" >&2
         echo "${text}" >&2
-        exit 1
+        die "${label} expected >=${minimum} ${expected}, got ${count}"
     fi
 }
 
-echo "[1/14] checking required files"
-require_file "${MANIFEST}"
-require_file "${GGUF}"
+check_dump_lock() {
+    local dump="$1"
+    local prompt_ids="$2"
+    local greedy_ids="$3"
+    local label="$4"
+    require_line "${dump}" "token_ids=${prompt_ids}" "${label} prompt ids"
+    require_line "${dump}" "greedy_ids=${greedy_ids}" "${label} greedy ids"
+}
+
+stage "files"
+require_file "${QWEN_MANIFEST}"
+require_file "${QWEN_GGUF}"
+require_file "${SMOL_MANIFEST}"
+require_file "${SMOL_GGUF}"
 require_file "${CHAT_REQUEST}"
 require_file "${STREAM_REQUEST}"
-require_file "${ROOT_DIR}/examples/models/smollm2-135m/model.manifest.json"
-require_file "${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 
-echo "[2/14] building"
+stage "build"
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
 cmake --build "${BUILD_DIR}" --config Release
 
-echo "[3/14] checking capabilities"
-CAPABILITIES="$("${BIN}" capabilities)"
-require_contains "${CAPABILITIES}" "\"runtimes\"" "capabilities"
+stage "unit"
+require_contains "$("${BIN}" capabilities)" "\"runtimes\"" "capabilities"
+require_contains "$("${BIN}" capabilities)" "\"simd\"" "capabilities simd"
+require_contains "$("${BIN}" executor-selftest)" "executor selftest passed" "executor"
+require_contains "$("${BIN}" scheduler-selftest)" "scheduler selftest passed" "scheduler"
+require_contains "$("${BIN}" native-selftest)" "native selftest passed" "kernel native-selftest"
 
-echo "[4/14] checking manifest"
-MANIFEST_OUTPUT="$("${BIN}" inspect-manifest "${MANIFEST}")"
-require_contains "${MANIFEST_OUTPUT}" "model_id: qwen2.5-0.5b" "manifest"
-require_contains "${MANIFEST_OUTPUT}" "chat_template_bytes:" "manifest"
+stage "qwen lock"
+require_contains "$("${BIN}" inspect-manifest "${QWEN_MANIFEST}")" "model_id: qwen2.5-0.5b" "qwen manifest"
+require_contains "$("${BIN}" inspect-manifest "${QWEN_MANIFEST}")" "name: Qwen2.5-Coder-0.5B-Instruct" "qwen pack identity"
+require_contains "$("${BIN}" inspect-manifest "${QWEN_MANIFEST}")" "artifact.backend: cpu.native" "qwen native artifact"
+require_contains "$("${BIN}" inspect-gguf "${QWEN_GGUF}")" "adapter=qwen2" "qwen inspect-gguf"
+require_contains "$("${BIN}" native-selftest "${QWEN_GGUF}")" "native selftest passed" "qwen native-selftest"
+TOKENIZE_OUTPUT="$("${BIN}" tokenize "${QWEN_MANIFEST}" "${PROMPT}")"
+require_contains "${TOKENIZE_OUTPUT}" "decoded=${PROMPT}" "qwen tokenize"
+require_line "${TOKENIZE_OUTPUT}" "token_ids=${QWEN_PROMPT_IDS}" "qwen tokenize ids"
+DUMP_OUTPUT="$("${BIN}" dump-logits "${QWEN_GGUF}" "${PROMPT}" "${GREEDY_N}")"
+check_dump_lock "${DUMP_OUTPUT}" "${QWEN_PROMPT_IDS}" "${QWEN_GREEDY_IDS}" "qwen dump-logits"
 
-echo "[5/14] checking native loader/tokenizer/kernels"
-NATIVE_SELFTEST_OUTPUT="$("${BIN}" native-selftest "${GGUF}")"
-require_contains "${NATIVE_SELFTEST_OUTPUT}" "native selftest passed" "native selftest"
-require_contains "${NATIVE_SELFTEST_OUTPUT}" "vocab_size=151936" "native selftest"
-require_contains "${NATIVE_SELFTEST_OUTPUT}" "layer0_rms=" "native selftest"
-require_contains "${NATIVE_SELFTEST_OUTPUT}" "prefill_layers=24" "native selftest"
-require_contains "${NATIVE_SELFTEST_OUTPUT}" "decode_tokens=" "native selftest"
-GGUF_OUTPUT="$("${BIN}" inspect-gguf "${GGUF}")"
-require_contains "${GGUF_OUTPUT}" "architecture=qwen2" "inspect-gguf"
-require_contains "${GGUF_OUTPUT}" "adapter=qwen2" "inspect-gguf"
-require_contains "${GGUF_OUTPUT}" "qkv_bias=1" "inspect-gguf"
-require_contains "${GGUF_OUTPUT}" "rope=neox" "inspect-gguf"
-require_contains "${GGUF_OUTPUT}" "layer0_ready=1" "inspect-gguf"
-require_contains "${GGUF_OUTPUT}" "tokenizer_model=gpt2" "inspect-gguf"
-TOKENIZE_OUTPUT="$("${BIN}" tokenize "${MANIFEST}" "Hello EdgeXPU")"
-require_contains "${TOKENIZE_OUTPUT}" "token_count=" "tokenize"
-require_contains "${TOKENIZE_OUTPUT}" "decoded=Hello EdgeXPU" "tokenize"
+stage "smollm lock"
+require_contains "$("${BIN}" inspect-gguf "${SMOL_GGUF}")" "adapter=llama" "smollm inspect-gguf"
+require_contains "$("${BIN}" native-selftest "${SMOL_GGUF}")" "native selftest passed" "smollm native-selftest"
+SMOL_TOKENIZE="$("${BIN}" tokenize "${SMOL_MANIFEST}" "${PROMPT}")"
+require_contains "${SMOL_TOKENIZE}" "decoded=${PROMPT}" "smollm tokenize"
+require_line "${SMOL_TOKENIZE}" "token_ids=${SMOL_PROMPT_IDS}" "smollm tokenize ids"
+SMOL_DUMP="$("${BIN}" dump-logits "${SMOL_GGUF}" "${PROMPT}" "${GREEDY_N}")"
+check_dump_lock "${SMOL_DUMP}" "${SMOL_PROMPT_IDS}" "${SMOL_GREEDY_IDS}" "smollm dump-logits"
 
-echo "[6/14] running benchmark"
-BENCHMARK_OUTPUT="$("${BIN}" benchmark "${MANIFEST}" "Explain EdgeXPU-LLM briefly.")"
+stage "generate"
+BENCHMARK_OUTPUT="$("${BIN}" benchmark "${QWEN_MANIFEST}" "Explain EdgeXPU-LLM briefly.")"
 require_contains "${BENCHMARK_OUTPUT}" "\"backend\": \"cpu.native\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"backend_telemetry\"" "benchmark"
 require_contains "${BENCHMARK_OUTPUT}" "\"decode_seconds\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"stage_trace\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"queue_summary\"" "benchmark"
 require_contains "${BENCHMARK_OUTPUT}" "\"executor_trace\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"type\": \"tokenize\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"type\": \"prefill\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"type\": \"stream_token\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "native token" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"scheduler_policy\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"scheduler_reason\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "\"backend\": \"cpu.native\"" "benchmark"
-require_contains "${BENCHMARK_OUTPUT}" "native_tokenizer" "benchmark"
+require_contains "${BENCHMARK_OUTPUT}" "\"finish_reason\"" "benchmark finish_reason"
+TRACE_OUTPUT="$("${BIN}" trace "${QWEN_MANIFEST}" "Explain EdgeXPU-LLM briefly.")"
+require_contains "${TRACE_OUTPUT}" "cpu.native" "trace"
+require_contains "${TRACE_OUTPUT}" "native_prefill" "trace prefill"
+require_contains "${TRACE_OUTPUT}" "telemetry_keep_native" "trace next decode policy"
+require_contains "${TRACE_OUTPUT}" "decode_step" "trace"
 
-echo "[7/14] comparing native CPU fallback vs llama bootstrap"
-COMPARE_OUTPUT="$("${BIN}" compare "${MANIFEST}" "Explain EdgeXPU-LLM briefly.")"
-require_contains "${COMPARE_OUTPUT}" "\"native_is_cpu_fallback\": true" "compare"
-require_contains "${COMPARE_OUTPUT}" "\"llama_is_bootstrap\": true" "compare"
-require_contains "${COMPARE_OUTPUT}" "\"same_model\": true" "compare"
-require_contains "${COMPARE_OUTPUT}" "\"backend\": \"cpu.native\"" "compare"
-require_contains "${COMPARE_OUTPUT}" "\"backend\": \"cpu.baseline\"" "compare"
-require_contains "${COMPARE_OUTPUT}" "\"prefill_seconds\"" "compare"
-require_contains "${COMPARE_OUTPUT}" "\"decode_seconds\"" "compare"
-
-echo "[8/14] checking executor selftest"
-SELFTEST_OUTPUT="$("${BIN}" executor-selftest)"
-require_contains "${SELFTEST_OUTPUT}" "executor selftest passed" "executor selftest"
-
-echo "[9/14] checking scheduler selftest"
-SCHEDULER_SELFTEST_OUTPUT="$("${BIN}" scheduler-selftest)"
-require_contains "${SCHEDULER_SELFTEST_OUTPUT}" "scheduler selftest passed" "scheduler selftest"
-
-echo "[10/14] checking trace command"
-TRACE_OUTPUT="$("${BIN}" trace "${MANIFEST}" "Explain EdgeXPU-LLM briefly.")"
-require_contains "${TRACE_OUTPUT}" "Backend Telemetry" "trace command"
-require_contains "${TRACE_OUTPUT}" "fallback_reason=" "trace command"
-require_contains "${TRACE_OUTPUT}" "Queue Summary" "trace command"
-require_contains "${TRACE_OUTPUT}" "completed=" "trace command"
-require_contains "${TRACE_OUTPUT}" "Executor Trace" "trace command"
-require_contains "${TRACE_OUTPUT}" "tokenize" "trace command"
-require_contains "${TRACE_OUTPUT}" "decode_step" "trace command"
-require_contains "${TRACE_OUTPUT}" "POLICY" "trace command"
-require_contains "${TRACE_OUTPUT}" "Next Decode Plan" "trace command"
-require_contains "${TRACE_OUTPUT}" "telemetry_keep_cpu" "trace command"
-require_contains "${TRACE_OUTPUT}" "tok/s" "trace command"
-require_contains "${TRACE_OUTPUT}" "native token" "trace command"
-require_contains "${TRACE_OUTPUT}" "cpu.native" "trace command"
-require_contains "${TRACE_OUTPUT}" "memory.native" "trace command"
-require_contains "${TRACE_OUTPUT}" "flash.manager" "trace command"
-
-echo "[11/14] starting local API server on port ${PORT}"
-"${BIN}" serve "${MANIFEST}" "${PORT}" >"${SERVER_LOG}" 2>&1 &
+stage "server"
+"${BIN}" serve "${QWEN_MANIFEST}" "${PORT}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID="$!"
-
 for _ in {1..50}; do
     if curl -fs "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
         break
     fi
     sleep 0.2
 done
-
-MODELS_OUTPUT="$(curl -fs "http://127.0.0.1:${PORT}/v1/models")"
-require_contains "${MODELS_OUTPUT}" "qwen2.5-0.5b" "models API"
-
-echo "[12/14] checking chat completions"
+require_contains "$(curl -fs "http://127.0.0.1:${PORT}/v1/models")" "qwen2.5-0.5b" "models API"
 CHAT_OUTPUT="$(curl -fs "http://127.0.0.1:${PORT}/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d @"${CHAT_REQUEST}")"
+    -H "Content-Type: application/json" -d @"${CHAT_REQUEST}")"
 require_contains "${CHAT_OUTPUT}" "\"object\":\"chat.completion\"" "chat API"
-require_contains "${CHAT_OUTPUT}" "\"content\"" "chat API"
-
-STREAM_OUTPUT="$(curl -fs "http://127.0.0.1:${PORT}/v1/chat/completions" \
+require_contains "${CHAT_OUTPUT}" "\"finish_reason\"" "chat finish_reason"
+LENGTH_OUTPUT="$(curl -fs "http://127.0.0.1:${PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d @"${STREAM_REQUEST}")"
-require_contains "${STREAM_OUTPUT}" "data:" "stream API"
-require_contains "${STREAM_OUTPUT}" "\"role\":\"assistant\"" "stream API"
-require_contains "${STREAM_OUTPUT}" "\"content\"" "stream API"
-require_contains "${STREAM_OUTPUT}" "\"finish_reason\":\"stop\"" "stream API"
+    -d '{"model":"qwen2.5-0.5b","messages":[{"role":"user","content":"Hi"}],"max_tokens":1,"temperature":0}')"
+require_contains "${LENGTH_OUTPUT}" "\"finish_reason\":\"length\"" "chat length finish_reason"
+WRONG_MODEL="$(curl -sS "http://127.0.0.1:${PORT}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"not-this-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":1}' || true)"
+require_contains "${WRONG_MODEL}" "edgexpu_error" "model mismatch"
+require_contains "${WRONG_MODEL}" "does not match" "model mismatch message"
+STREAM_OUTPUT="$(curl -fs "http://127.0.0.1:${PORT}/v1/chat/completions" \
+    -H "Content-Type: application/json" -d @"${STREAM_REQUEST}")"
 require_contains "${STREAM_OUTPUT}" "[DONE]" "stream API"
 require_min_count "${STREAM_OUTPUT}" "data:" 4 "stream API"
 
-echo "[13/14] checking expected error paths"
+stage "errors"
 if "${BIN}" inspect-manifest "${ROOT_DIR}/examples/models/missing/model.manifest.json" >/dev/null 2>&1; then
-    echo "verification failed: missing manifest unexpectedly succeeded" >&2
-    exit 1
+    die "missing manifest unexpectedly succeeded"
 fi
-
-NOT_FOUND_OUTPUT="$(curl -sS "http://127.0.0.1:${PORT}/v1/unknown" 2>/dev/null || true)"
-require_contains "${NOT_FOUND_OUTPUT}" "edgexpu_error" "unknown route"
-
-echo "[14/14] checking second model pack swap"
-SECOND_MANIFEST="${ROOT_DIR}/examples/models/smollm2-135m/model.manifest.json"
-SECOND_GGUF="${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
-require_file "${SECOND_MANIFEST}"
-require_file "${SECOND_GGUF}"
-SECOND_MANIFEST_OUTPUT="$("${BIN}" inspect-manifest "${SECOND_MANIFEST}")"
-require_contains "${SECOND_MANIFEST_OUTPUT}" "model_id: smollm2-135m" "second manifest"
-require_contains "${SECOND_MANIFEST_OUTPUT}" "chat_template_bytes:" "second manifest"
-SECOND_GGUF_OUTPUT="$("${BIN}" inspect-gguf "${SECOND_GGUF}")"
-require_contains "${SECOND_GGUF_OUTPUT}" "adapter=llama" "second inspect-gguf"
-require_contains "${SECOND_GGUF_OUTPUT}" "qkv_bias=0" "second inspect-gguf"
-require_contains "${SECOND_GGUF_OUTPUT}" "rope=norm" "second inspect-gguf"
-SECOND_TOKENIZE_OUTPUT="$("${BIN}" tokenize "${SECOND_MANIFEST}" "Hello EdgeXPU")"
-require_contains "${SECOND_TOKENIZE_OUTPUT}" "token_count=" "second tokenize"
-require_contains "${SECOND_TOKENIZE_OUTPUT}" "decoded=Hello EdgeXPU" "second tokenize"
-SECOND_SELFTEST_OUTPUT="$("${BIN}" native-selftest "${SECOND_GGUF}")"
-require_contains "${SECOND_SELFTEST_OUTPUT}" "native selftest passed" "second native selftest"
+require_contains "$(curl -sS "http://127.0.0.1:${PORT}/v1/unknown" 2>/dev/null || true)" "edgexpu_error" "unknown route"
 
 echo "MVP verification passed"

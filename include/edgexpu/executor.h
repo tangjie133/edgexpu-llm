@@ -10,10 +10,15 @@
 extern "C" {
 #endif
 
+/* 单线程 runnable job 队列。契约是异步的（submit → pending → run → callback），
+ * 当前实现仍同步执行，不是线程池。容量固定，生成前可丢掉已完成 job。
+ */
+
 #define EDGEXPU_EXECUTOR_MAX_JOBS 256
 
 typedef struct edgexpu_executor_job edgexpu_executor_job;
 
+/* 返回非 0 表示成功。失败时应写入 error。 */
 typedef int (*edgexpu_executor_job_callback)(
     edgexpu_executor_job *job,
     void *user_data,
@@ -97,6 +102,7 @@ int edgexpu_executor_submit_with_reason(
     size_t error_size
 );
 
+/* 提交带 callback 的 job。run_next 执行到它时调用 callback。 */
 int edgexpu_executor_submit_runnable(
     edgexpu_executor *executor,
     edgexpu_executor_job_type type,
@@ -144,6 +150,7 @@ int edgexpu_executor_run_job(
     size_t error_size
 );
 
+/* 取出下一个 pending job 并执行其 callback。无 pending 时返回 0。 */
 int edgexpu_executor_run_next(
     edgexpu_executor *executor,
     char *error,

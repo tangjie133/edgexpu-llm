@@ -58,6 +58,7 @@ static char *read_file(const char *path, char *error, size_t error_size) {
     return buffer;
 }
 
+/* 支持 \n \t \" 转义，以便 chat_template 能带换行。 */
 static int extract_string(
     const char *json,
     const char *key,
@@ -256,6 +257,7 @@ int edgexpu_manifest_load(
         return 0;
     }
 
+    extract_string(json, "name", manifest->name, sizeof(manifest->name));
     extract_int(json, "memory_required_mb", &manifest->memory_required_mb);
     extract_int(json, "kv_cache_required_mb", &manifest->kv_cache_required_mb);
     extract_string(json, "quantization", manifest->primary_artifact.quantization, sizeof(manifest->primary_artifact.quantization));
@@ -277,6 +279,9 @@ void edgexpu_manifest_print(const edgexpu_model_manifest *manifest) {
     }
 
     printf("model_id: %s\n", manifest->model_id);
+    if (manifest->name[0] != '\0') {
+        printf("name: %s\n", manifest->name);
+    }
     printf("family: %s\n", manifest->family);
     printf("parameter_size: %s\n", manifest->parameter_size);
     printf("context_length: %d\n", manifest->context_length);

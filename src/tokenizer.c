@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* GPT-2 BPE：bytes-to-unicode + merge 表。特殊 token 以 `<...>` 整段匹配 vocab。 */
+
 #define EDGEXPU_BPE_MAX_PIECES 256
 #define EDGEXPU_MERGE_BLOB_CAP (12u * 1024u * 1024u)
 
@@ -52,6 +54,7 @@ static size_t utf8_len(unsigned char lead) {
     return 1;
 }
 
+/* HuggingFace GPT-2 bytes_to_unicode：可打印字节恒等，其余映射到 U+0100 起。 */
 static void gpt2_init_tables(void) {
     int b;
     int n;
@@ -292,6 +295,7 @@ static int vocab_lookup(
     return 0;
 }
 
+/* 从 `<` 扫到 `>`，整段在 vocab 中则当作特殊 token（不走 byte mapping）。 */
 static int try_angle_token(
     const edgexpu_tokenizer *tokenizer,
     const char *cursor,
@@ -449,6 +453,7 @@ int edgexpu_tokenizer_build_index(edgexpu_tokenizer *tokenizer, char *error, siz
     return tokenizer->ready;
 }
 
+/* 对单个“词”做贪心 BPE merge。word 已是 GPT-2 unicode 映射后的字节串。 */
 static int encode_word(
     const edgexpu_tokenizer *tokenizer,
     const char *word,
@@ -510,6 +515,379 @@ static int encode_word(
     return 1;
 }
 
+#define EDGEXPU_PRE_MAX_CPTS 8192
+
+typedef enum {
+    EDGEXPU_PRE_GPT2 = 0,
+    EDGEXPU_PRE_QWEN2 = 1,
+    EDGEXPU_PRE_LLAMA3 = 2
+} edgexpu_pre_kind;
+
+static edgexpu_pre_kind pre_kind_from_name(const char *pre) {
+    if (pre == NULL || pre[0] == '\0' ||
+        strcmp(pre, "default") == 0 ||
+        strcmp(pre, "gpt2") == 0 ||
+        strcmp(pre, "olmo") == 0 ||
+        strcmp(pre, "jais") == 0) {
+        return EDGEXPU_PRE_GPT2;
+    }
+    if (strcmp(pre, "llama3") == 0 ||
+        strcmp(pre, "llama-v3") == 0 ||
+        strcmp(pre, "llama-bpe") == 0) {
+        return EDGEXPU_PRE_LLAMA3;
+    }
+    /* qwen2 / smollm / stablelm2：单个数字，可选前缀标点 + 字母。 */
+    return EDGEXPU_PRE_QWEN2;
+}
+
+static uint32_t utf8_next_cp(const char *s, const char *end, size_t *nbytes) {
+    unsigned char lead;
+    size_t n;
+    uint32_t cp;
+
+    if (s >= end) {
+        *nbytes = 0;
+        return 0;
+    }
+    lead = (unsigned char)s[0];
+    n = utf8_len(lead);
+    if (s + n > end) {
+        n = 1;
+    }
+    if (n == 1) {
+        cp = lead;
+    } else if (n == 2) {
+        cp = ((uint32_t)(lead & 0x1Fu) << 6) | (uint32_t)((unsigned char)s[1] & 0x3Fu);
+    } else if (n == 3) {
+        cp = ((uint32_t)(lead & 0x0Fu) << 12) |
+            ((uint32_t)((unsigned char)s[1] & 0x3Fu) << 6) |
+            (uint32_t)((unsigned char)s[2] & 0x3Fu);
+    } else {
+        cp = ((uint32_t)(lead & 0x07u) << 18) |
+            ((uint32_t)((unsigned char)s[1] & 0x3Fu) << 12) |
+            ((uint32_t)((unsigned char)s[2] & 0x3Fu) << 6) |
+            (uint32_t)((unsigned char)s[3] & 0x3Fu);
+    }
+    *nbytes = n;
+    return cp;
+}
+
+static int cpt_is_whitespace(uint32_t cp) {
+    return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' ||
+        cp == 0x0Bu || cp == 0x0Cu || cp == 0xA0u;
+}
+
+static int cpt_is_number(uint32_t cp) {
+    return cp >= '0' && cp <= '9';
+}
+
+static int cpt_is_letter(uint32_t cp) {
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) {
+        return 1;
+    }
+    if (cp < 0x80u) {
+        return 0;
+    }
+    if (cpt_is_number(cp) || cpt_is_whitespace(cp)) {
+        return 0;
+    }
+    if (cp == 0xD7u || cp == 0xF7u) {
+        return 0;
+    }
+    if (cp >= 0xC0u && cp < 0x100u) {
+        return 1;
+    }
+    if ((cp >= 0x2000u && cp <= 0x206Fu) ||
+        (cp >= 0x3000u && cp <= 0x303Fu) ||
+        (cp >= 0xFF01u && cp <= 0xFF0Fu) ||
+        (cp >= 0xFF1Au && cp <= 0xFF20u) ||
+        (cp >= 0xFF3Bu && cp <= 0xFF40u) ||
+        (cp >= 0xFF5Bu && cp <= 0xFF65u)) {
+        return 0;
+    }
+    return 1;
+}
+
+static uint32_t ascii_tolower(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') {
+        return cp - (uint32_t)('A' - 'a');
+    }
+    return cp;
+}
+
+static int decode_codepoints(
+    const char *text,
+    size_t text_len,
+    uint32_t *cps,
+    size_t *byte_off,
+    int max_n,
+    int *n_out
+) {
+    const char *end = text + text_len;
+    const char *p = text;
+    int n = 0;
+
+    while (p < end && n < max_n) {
+        size_t nbytes = 0;
+        cps[n] = utf8_next_cp(p, end, &nbytes);
+        if (nbytes == 0) {
+            break;
+        }
+        byte_off[n] = (size_t)(p - text);
+        p += nbytes;
+        n++;
+    }
+    *n_out = n;
+    return p >= end;
+}
+
+static uint32_t cpt_at(const uint32_t *cps, int n, int pos) {
+    if (pos < 0 || pos >= n) {
+        return 0xFFFFFFFFu;
+    }
+    return cps[pos];
+}
+
+static int flags_letter(const uint32_t *cps, int n, int pos) {
+    return pos >= 0 && pos < n && cpt_is_letter(cps[pos]);
+}
+
+static int flags_number(const uint32_t *cps, int n, int pos) {
+    return pos >= 0 && pos < n && cpt_is_number(cps[pos]);
+}
+
+static int flags_ws(const uint32_t *cps, int n, int pos) {
+    return pos >= 0 && pos < n && cpt_is_whitespace(cps[pos]);
+}
+
+/* 对照 llama.cpp unicode_regex_split_custom_{gpt2,qwen2,llama3}。 */
+static int pretok_split(
+    edgexpu_pre_kind kind,
+    const uint32_t *cps,
+    int n,
+    int *starts,
+    int *ends,
+    int max_words
+) {
+    int pos = 0;
+    int n_words = 0;
+    const uint32_t OOR = 0xFFFFFFFFu;
+
+    while (pos < n && n_words < max_words) {
+        uint32_t cpt = cps[pos];
+        int start = pos;
+
+        if (cpt == '\'' && pos + 1 < n) {
+            uint32_t next = cps[pos + 1];
+            uint32_t next_l = (kind == EDGEXPU_PRE_GPT2) ? next : ascii_tolower(next);
+            if (next_l == 's' || next_l == 't' || next_l == 'm' || next_l == 'd') {
+                starts[n_words] = start;
+                ends[n_words] = pos + 2;
+                n_words++;
+                pos += 2;
+                continue;
+            }
+            if (pos + 2 < n) {
+                uint32_t n2 = cps[pos + 2];
+                uint32_t n2_l = (kind == EDGEXPU_PRE_GPT2) ? n2 : ascii_tolower(n2);
+                if ((next_l == 'r' && n2_l == 'e') ||
+                    (next_l == 'v' && n2_l == 'e') ||
+                    (next_l == 'l' && n2_l == 'l')) {
+                    starts[n_words] = start;
+                    ends[n_words] = pos + 3;
+                    n_words++;
+                    pos += 3;
+                    continue;
+                }
+            }
+        }
+
+        if (kind == EDGEXPU_PRE_GPT2) {
+            int letter_pos = (cpt == ' ' && pos + 1 < n) ? pos + 1 : pos;
+            if (flags_letter(cps, n, letter_pos)) {
+                pos = letter_pos;
+                while (flags_letter(cps, n, pos)) {
+                    pos++;
+                }
+                starts[n_words] = start;
+                ends[n_words] = pos;
+                n_words++;
+                continue;
+            }
+            if (flags_number(cps, n, letter_pos)) {
+                pos = letter_pos;
+                while (flags_number(cps, n, pos)) {
+                    pos++;
+                }
+                starts[n_words] = start;
+                ends[n_words] = pos;
+                n_words++;
+                continue;
+            }
+            if (!flags_ws(cps, n, letter_pos) &&
+                !flags_letter(cps, n, letter_pos) &&
+                !flags_number(cps, n, letter_pos) &&
+                letter_pos < n) {
+                pos = letter_pos;
+                while (pos < n &&
+                       !flags_ws(cps, n, pos) &&
+                       !flags_letter(cps, n, pos) &&
+                       !flags_number(cps, n, pos)) {
+                    pos++;
+                }
+                starts[n_words] = start;
+                ends[n_words] = pos;
+                n_words++;
+                continue;
+            }
+        } else {
+            if (!(cpt == '\r' || cpt == '\n' || cpt_is_number(cpt))) {
+                if (cpt_is_letter(cpt) || flags_letter(cps, n, pos + 1)) {
+                    pos++;
+                    while (flags_letter(cps, n, pos)) {
+                        pos++;
+                    }
+                    starts[n_words] = start;
+                    ends[n_words] = pos;
+                    n_words++;
+                    continue;
+                }
+            }
+            if (cpt_is_number(cpt)) {
+                if (kind == EDGEXPU_PRE_LLAMA3) {
+                    int ini = pos;
+                    while (flags_number(cps, n, pos)) {
+                        pos++;
+                        if (pos - ini >= 3) {
+                            starts[n_words] = ini;
+                            ends[n_words] = pos;
+                            n_words++;
+                            if (n_words >= max_words) {
+                                return n_words;
+                            }
+                            ini = pos;
+                        }
+                    }
+                    if (pos > ini) {
+                        starts[n_words] = ini;
+                        ends[n_words] = pos;
+                        n_words++;
+                    }
+                } else {
+                    starts[n_words] = start;
+                    ends[n_words] = pos + 1;
+                    n_words++;
+                    pos++;
+                }
+                continue;
+            }
+            {
+                int punct_pos = (cpt == ' ' && pos + 1 < n) ? pos + 1 : pos;
+                if (punct_pos < n &&
+                    !flags_ws(cps, n, punct_pos) &&
+                    !flags_letter(cps, n, punct_pos) &&
+                    !flags_number(cps, n, punct_pos)) {
+                    pos = punct_pos;
+                    while (pos < n &&
+                           !flags_ws(cps, n, pos) &&
+                           !flags_letter(cps, n, pos) &&
+                           !flags_number(cps, n, pos)) {
+                        pos++;
+                    }
+                    while (pos < n && (cps[pos] == '\r' || cps[pos] == '\n')) {
+                        pos++;
+                    }
+                    starts[n_words] = start;
+                    ends[n_words] = pos;
+                    n_words++;
+                    continue;
+                }
+            }
+        }
+
+        {
+            int num_ws = 0;
+            int last_nl = 0;
+            while (flags_ws(cps, n, pos + num_ws)) {
+                uint32_t w = cps[pos + num_ws];
+                if (w == '\r' || w == '\n') {
+                    last_nl = pos + num_ws + 1;
+                }
+                num_ws++;
+            }
+            if (kind != EDGEXPU_PRE_GPT2 && last_nl > 0) {
+                starts[n_words] = start;
+                ends[n_words] = last_nl;
+                n_words++;
+                pos = last_nl;
+                continue;
+            }
+            if (num_ws > 1 && cpt_at(cps, n, pos + num_ws) != OOR) {
+                pos += num_ws - 1;
+                starts[n_words] = start;
+                ends[n_words] = pos;
+                n_words++;
+                continue;
+            }
+            if (num_ws > 0) {
+                pos += num_ws;
+                starts[n_words] = start;
+                ends[n_words] = pos;
+                n_words++;
+                continue;
+            }
+        }
+
+        starts[n_words] = start;
+        ends[n_words] = pos + 1;
+        n_words++;
+        pos++;
+    }
+
+    return n_words;
+}
+
+static int encode_chunk(
+    const edgexpu_tokenizer *tokenizer,
+    const char *chunk,
+    size_t chunk_len,
+    uint32_t *ids,
+    int max_ids,
+    int *written
+) {
+    uint32_t cps[EDGEXPU_PRE_MAX_CPTS];
+    size_t byte_off[EDGEXPU_PRE_MAX_CPTS];
+    int starts[EDGEXPU_PRE_MAX_CPTS];
+    int ends[EDGEXPU_PRE_MAX_CPTS];
+    int n_cps = 0;
+    int n_words;
+    int w;
+    edgexpu_pre_kind kind = pre_kind_from_name(tokenizer->pre);
+
+    if (chunk_len == 0) {
+        return 1;
+    }
+    if (!decode_codepoints(chunk, chunk_len, cps, byte_off, EDGEXPU_PRE_MAX_CPTS, &n_cps)) {
+        return 0;
+    }
+    n_words = pretok_split(kind, cps, n_cps, starts, ends, EDGEXPU_PRE_MAX_CPTS);
+    for (w = 0; w < n_words; w++) {
+        size_t b0 = byte_off[starts[w]];
+        size_t b1 = (ends[w] < n_cps) ? byte_off[ends[w]] : chunk_len;
+        char mapped[1024];
+        size_t mapped_len = 0;
+        if (b1 <= b0) {
+            continue;
+        }
+        if (!gpt2_map_bytes(chunk + b0, b1 - b0, mapped, sizeof(mapped), &mapped_len) ||
+            !encode_word(tokenizer, mapped, mapped_len, ids, max_ids, written)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* 先抠特殊 token，再按 tokenizer.ggml.pre 做 GPT-2 族切词 + byte mapping + BPE。 */
 int edgexpu_tokenizer_encode(
     const edgexpu_tokenizer *tokenizer,
     const char *text,
@@ -537,12 +915,9 @@ int edgexpu_tokenizer_encode(
 
     cursor = text != NULL ? text : "";
     while (*cursor != '\0') {
-        char raw[256];
-        char mapped[512];
-        size_t raw_len = 0;
-        size_t mapped_len = 0;
         uint32_t special_id = 0;
         size_t special_len = 0;
+        const char *chunk_end;
 
         if (try_angle_token(tokenizer, cursor, &special_id, &special_len)) {
             if (written >= max_ids) {
@@ -554,36 +929,33 @@ int edgexpu_tokenizer_encode(
             continue;
         }
 
-        if (*cursor == ' ') {
-            raw[raw_len++] = *cursor++;
-            while (*cursor != '\0' && *cursor != ' ' && *cursor != '<' &&
-                   *cursor != '\n' && *cursor != '\r' && *cursor != '\t' &&
-                   raw_len + 1 < sizeof(raw)) {
-                raw[raw_len++] = *cursor++;
+        chunk_end = cursor + 1;
+        while (*chunk_end != '\0') {
+            uint32_t ignore_id = 0;
+            size_t ignore_len = 0;
+            if (try_angle_token(tokenizer, chunk_end, &ignore_id, &ignore_len)) {
+                break;
             }
-        } else if (*cursor == '\n' || *cursor == '\r' || *cursor == '\t') {
-            raw[raw_len++] = *cursor++;
-        } else {
-            while (*cursor != '\0' && *cursor != ' ' && *cursor != '<' &&
-                   *cursor != '\n' && *cursor != '\r' && *cursor != '\t' &&
-                   raw_len + 1 < sizeof(raw)) {
-                raw[raw_len++] = *cursor++;
-            }
+            chunk_end++;
         }
-        if (raw_len == 0) {
-            break;
-        }
-        if (!gpt2_map_bytes(raw, raw_len, mapped, sizeof(mapped), &mapped_len) ||
-            !encode_word(tokenizer, mapped, mapped_len, ids, max_ids, &written)) {
+        if (!encode_chunk(
+                tokenizer,
+                cursor,
+                (size_t)(chunk_end - cursor),
+                ids,
+                max_ids,
+                &written)) {
             set_error(error, error_size, "native tokenizer 输出过长");
             return 0;
         }
+        cursor = chunk_end;
     }
 
     *id_count = written;
     return 1;
 }
 
+/* 把 vocab piece 的 unicode 码点映回原始字节；未映射码点保持 UTF-8。 */
 int edgexpu_tokenizer_decode(
     const edgexpu_tokenizer *tokenizer,
     const uint32_t *ids,

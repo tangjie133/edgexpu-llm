@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 连续缓冲：[layer][pos][kv_head * head_dim]。pos 超出 max_seq 由 extend 拒绝。 */
+
 static void set_error(char *error, size_t error_size, const char *message) {
     if (error != NULL && error_size > 0) {
         snprintf(error, error_size, "%s", message);
@@ -77,7 +79,16 @@ int edgexpu_kv_cache_extend(edgexpu_kv_cache *cache, int tokens, char *error, si
         return 0;
     }
     if (cache->seq_len + tokens > cache->max_seq) {
-        set_error(error, error_size, "native KV cache 超出 max_seq 窗口");
+        if (error != NULL && error_size > 0) {
+            snprintf(
+                error,
+                error_size,
+                "native KV cache 超出窗口：seq_len=%d + %d > max_seq=%d",
+                cache->seq_len,
+                tokens,
+                cache->max_seq
+            );
+        }
         return 0;
     }
     cache->seq_len += tokens;
@@ -136,6 +147,15 @@ int edgexpu_kv_cache_selftest(char *error, size_t error_size) {
     if (cache.seq_len != 0) {
         edgexpu_kv_cache_free(&cache);
         set_error(error, error_size, "KV reset selftest failed");
+        return 0;
+    }
+    if (!edgexpu_kv_cache_extend(&cache, 8, error, error_size)) {
+        edgexpu_kv_cache_free(&cache);
+        return 0;
+    }
+    if (edgexpu_kv_cache_extend(&cache, 1, error, error_size)) {
+        edgexpu_kv_cache_free(&cache);
+        set_error(error, error_size, "KV overflow selftest should fail");
         return 0;
     }
     edgexpu_kv_cache_free(&cache);

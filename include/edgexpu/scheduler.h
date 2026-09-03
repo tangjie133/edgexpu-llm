@@ -12,6 +12,11 @@
 extern "C" {
 #endif
 
+/* 按 job 类型、设备能力和最近 telemetry 给出执行决策。
+ * 初版仍主要落到 CPU；NPU/dNPU 路由是后续阶段。
+ */
+
+/* native 路径各子系统是否已就绪，供 plan 决定 tokenize/prefill/decode 走哪条 backend。 */
 typedef struct edgexpu_schedule_native_ready {
     int loader;
     int tokenizer;

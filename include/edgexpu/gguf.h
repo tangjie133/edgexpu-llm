@@ -11,24 +11,28 @@
 extern "C" {
 #endif
 
+/* 有限 GGUF v3 loader：读 metadata、tensor 目录和 GPT-2 tokenizer。
+ * 不解析全部 KV；权重本体由 native 路径 mmap 后再按 tensor 反量化。
+ */
+
 #define EDGEXPU_GGUF_MAX_TENSORS 512
 #define EDGEXPU_GGUF_TENSOR_NAME 96
 
 typedef struct edgexpu_gguf_tensor {
     char name[EDGEXPU_GGUF_TENSOR_NAME];
     uint32_t n_dims;
-    uint32_t type;
+    uint32_t type;     /* GGUF 量化类型，见 gguf_quant.h */
     uint64_t dims[4];
-    uint64_t offset;
+    uint64_t offset;   /* 相对 data_offset 的字节偏移 */
 } edgexpu_gguf_tensor;
 
 typedef struct edgexpu_gguf_info {
     char path[EDGEXPU_TEXT_LARGE];
-    char architecture[EDGEXPU_TEXT_SMALL];
+    char architecture[EDGEXPU_TEXT_SMALL]; /* general.architecture，供 adapter 选择 */
     char name[EDGEXPU_TEXT_SMALL];
     char tokenizer_model[EDGEXPU_TEXT_SMALL];
     char tokenizer_pre[EDGEXPU_TEXT_SMALL];
-    char chat_template[EDGEXPU_TEXT_LARGE];
+    char chat_template[EDGEXPU_TEXT_LARGE]; /* GGUF tokenizer.chat_template；过长会截断 */
     uint32_t version;
     uint32_t block_count;
     uint32_t context_length;
@@ -53,6 +57,7 @@ typedef struct edgexpu_gguf_info {
 
 void edgexpu_gguf_info_init(edgexpu_gguf_info *info);
 
+/* 打开 GGUF，填充 info；tokenizer 非空时同时加载 tokens/merges。 */
 int edgexpu_gguf_load(
     const char *path,
     edgexpu_gguf_info *info,
@@ -61,6 +66,7 @@ int edgexpu_gguf_load(
     size_t error_size
 );
 
+/* embedding_length / head_count。GQA 时 KV 头更少，head_dim 仍按 query 头计算。 */
 int edgexpu_gguf_head_dim(const edgexpu_gguf_info *info);
 
 const edgexpu_gguf_tensor *edgexpu_gguf_find_tensor(

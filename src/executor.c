@@ -4,6 +4,10 @@
 #include <string.h>
 #include <time.h>
 
+/* 固定容量环形语义：jobs[] 线性追加，drop_terminal 压缩掉已结束项。
+ * 当前 run_next 在调用线程同步执行 callback。
+ */
+
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -109,6 +113,7 @@ int edgexpu_executor_submit_with_reason(
     );
 }
 
+/* 写入队列槽并挂上 callback；真正执行发生在 run_next。 */
 int edgexpu_executor_submit_runnable(
     edgexpu_executor *executor,
     edgexpu_executor_job_type type,
@@ -257,6 +262,7 @@ int edgexpu_executor_run_job(
     return edgexpu_executor_mark_completed(executor, job_id, error, error_size);
 }
 
+/* 找第一个 pending job，调用其 callback，再标 completed/failed。 */
 int edgexpu_executor_run_next(
     edgexpu_executor *executor,
     char *error,
