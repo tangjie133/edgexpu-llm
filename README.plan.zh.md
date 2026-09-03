@@ -144,7 +144,7 @@ EdgeXPU-LLM **不是**某一个 GGUF 专用推理器。当前仓库里的 **nati
 - 新增 f32 CPU kernel：`add`、`mul`、`rmsnorm`、`silu`、`softmax`、`matmul`。
 - 新增 native KV cache，按 `block_count × head_count_kv × head_dim × max_seq` 分配有限窗口，默认 256。
 - runtime 在加载 GGUF 后持有 `edgexpu_native_session`；`tokenize` 走 `cpu.native`，KV job 走 `memory.native`。
-- decode 由 native greedy/temperature sampling 逐步完成；`llama cli` 仅在 native session 未就绪时回退。
+- decode 由 native greedy/temperature sampling 逐步完成；产品路径不回退 `llama cli`。
 - 新增 CLI：`inspect-gguf`、`tokenize`、`native-selftest`。
 
 ### 2026-09-02：GGUF 权重 + 第一层 native compute
@@ -178,7 +178,7 @@ EdgeXPU-LLM **不是**某一个 GGUF 专用推理器。当前仓库里的 **nati
 - 分项记录 prefill tok/s 与 decode tok/s，不拿 wall-clock 里的 load 当 decode
 - **GPU / NPU 上的 llama 数字不是 native CPU KPI**
 
-`edgexpu compare` 若未关 GPU，其耗时不能当验收。数值对齐仍用 `scripts/align_llama.sh`（`--no-conversation`）。
+`edgexpu compare` 若未关 GPU，其耗时不能当验收。compare 在 native 不能 load 时仍会跑 llama 腿（例如 Qwen3.5 缺 SSM adapter）；产品 `generate` 不会。数值对齐仍用 `scripts/align_llama.sh`（`--no-conversation`）。
 
 ### 尺子 A：桌面 CPU fallback（必须够用，不必赢）
 
@@ -421,7 +421,7 @@ bash scripts/verify_arm.sh
 | --- | --- |
 | `bash scripts/verify_mvp.sh` | 日常 / CI：只测 native CPU fallback，不 shell-out llama.cpp |
 | `scripts/verify.locks` | 共享 dump prompt 与 greedy n |
-| `examples/models/<pack>/verify.lock` | 该包 tokenize / greedy id；缺 GGUF 则跳过 |
+| `examples/models/<pack>/verify.lock` | 该包 tokenize / greedy id；缺该包 GGUF 则跳过该包；零个 `NATIVE=1` 包则 `verify_mvp.sh` 失败 |
 | `bash scripts/align_llama.sh` | 可选对照 llama.cpp 数值（`--no-conversation` / greedy id） |
 | `bash scripts/bench_cpu.sh` | 可选公平 CPU 速度对照（n=32，llama `-ngl 0` + 隐藏 GPU） |
 | `bash scripts/verify_arm.sh` | Phase 3.3：aarch64 NEON 构建；x86 上 qemu unit，实机跑 greedy 锁点 |

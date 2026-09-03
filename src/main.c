@@ -1,3 +1,4 @@
+#include "edgexpu/chat.h"
 #include "edgexpu/executor.h"
 #include "edgexpu/manifest.h"
 #include "edgexpu/native.h"
@@ -23,7 +24,7 @@ static void print_usage(void) {
     printf("  edgexpu inspect-manifest <manifest.json>\n");
     printf("  edgexpu generate <manifest.json|model.gguf> <prompt> [max_tokens]\n");
     printf("  edgexpu benchmark <manifest.json|model.gguf> <prompt> [max_tokens]\n");
-    printf("  edgexpu compare <manifest.json|model.gguf> <prompt>\n");
+    printf("  edgexpu compare <manifest.json|model.gguf> <prompt>  (llama 腿不依赖 native load)\n");
     printf("  edgexpu trace <manifest.json|model.gguf> <prompt>\n");
     printf("  edgexpu inspect-gguf <model.gguf>\n");
     printf("  edgexpu tokenize <manifest.json|model.gguf> <text>\n");
@@ -347,18 +348,27 @@ static int command_generate(const char *manifest_path, const char *prompt, int m
     return 0;
 }
 
-static void print_compare_leg(const char *name, const edgexpu_generation_result *result) {
+static void print_compare_leg(
+    const char *name,
+    const edgexpu_generation_result *result,
+    int ok,
+    const char *leg_error
+) {
     char escaped_text[EDGEXPU_TEXT_PROMPT * 2];
+    char escaped_error[512];
     double total;
     double decode_tps;
 
     json_escape(result->text, escaped_text, sizeof(escaped_text));
+    json_escape(leg_error != NULL ? leg_error : "", escaped_error, sizeof(escaped_error));
     total = result->telemetry.total_seconds > 0.0 ? result->telemetry.total_seconds : result->elapsed_seconds;
     decode_tps = result->telemetry.decode_seconds > 0.0
         ? (double)result->completion_tokens_approx / result->telemetry.decode_seconds
         : 0.0;
     printf("  \"%s\": {\n", name);
+    printf("    \"ok\": %s,\n", ok ? "true" : "false");
     printf("    \"backend\": \"%s\",\n", result->backend);
+    printf("    \"error\": \"%s\",\n", escaped_error);
     printf("    \"elapsed_seconds\": %.6f,\n", result->elapsed_seconds);
     printf("    \"total_seconds\": %.6f,\n", total);
     printf("    \"prefill_seconds\": %.6f,\n", result->telemetry.prefill_seconds);
@@ -370,44 +380,71 @@ static void print_compare_leg(const char *name, const edgexpu_generation_result 
     printf("  }");
 }
 
-/* 同模型对比 native CPU fallback 与 llama bootstrap。 */
+/* 同模型对照：native 与 llama 腿独立。native 不能 load 时仍跑 llama（产品 generate 不会这样）。 */
 static int command_compare(const char *manifest_path, const char *prompt) {
     edgexpu_runtime runtime;
     edgexpu_generation_request request;
     edgexpu_generation_result native_result;
     edgexpu_generation_result llama_result;
-    char error[256] = {0};
+    const edgexpu_backend *llama;
+    char native_error[256] = {0};
+    char llama_error[256] = {0};
+    char formatted[EDGEXPU_TEXT_PROMPT];
+    int native_ok = 0;
+    int llama_ok = 0;
     double native_total;
     double llama_total;
 
+    memset(&native_result, 0, sizeof(native_result));
+    memset(&llama_result, 0, sizeof(llama_result));
+    snprintf(native_result.backend, sizeof(native_result.backend), "cpu.native");
+    snprintf(llama_result.backend, sizeof(llama_result.backend), "cpu.baseline");
+
     edgexpu_runtime_init(&runtime);
-    if (!edgexpu_runtime_load_model(&runtime, manifest_path, error, sizeof(error))) {
-        fprintf(stderr, "模型加载失败：%s\n", error);
-        edgexpu_runtime_shutdown(&runtime);
-        return 1;
+    if (edgexpu_runtime_load_model(&runtime, manifest_path, native_error, sizeof(native_error))) {
+        memset(&request, 0, sizeof(request));
+        request.prompt = prompt;
+        request.max_tokens = 8;
+        request.temperature = 0.0f;
+        request.cpu_path = EDGEXPU_CPU_PATH_NATIVE;
+        native_ok = edgexpu_runtime_generate(&runtime, &request, &native_result, native_error, sizeof(native_error));
+        if (!native_ok) {
+            snprintf(native_result.backend, sizeof(native_result.backend), "cpu.native");
+        }
+        edgexpu_executor_drop_terminal(&runtime.executor);
     }
 
-    memset(&request, 0, sizeof(request));
-    request.prompt = prompt;
-    request.max_tokens = 8;
-    request.temperature = 0.0f;
-    request.cpu_path = EDGEXPU_CPU_PATH_NATIVE;
-    if (!edgexpu_runtime_generate(&runtime, &request, &native_result, error, sizeof(error))) {
-        fprintf(stderr, "native CPU fallback 对比失败：%s\n", error);
-        edgexpu_runtime_shutdown(&runtime);
-        return 1;
+    llama = edgexpu_backend_cpu_baseline();
+    if (runtime.manifest.model_id[0] == '\0') {
+        if (edgexpu_path_is_gguf(manifest_path)) {
+            (void)edgexpu_manifest_from_gguf(manifest_path, &runtime.manifest, llama_error, sizeof(llama_error));
+        } else {
+            (void)edgexpu_manifest_load(manifest_path, &runtime.manifest, llama_error, sizeof(llama_error));
+        }
     }
-
-    edgexpu_executor_drop_terminal(&runtime.executor);
+    formatted[0] = '\0';
+    if (runtime.manifest.chat_template[0] != '\0') {
+        (void)edgexpu_chat_apply(
+            runtime.manifest.chat_template,
+            prompt,
+            formatted,
+            sizeof(formatted)
+        );
+    }
     memset(&request, 0, sizeof(request));
-    request.prompt = prompt;
+    request.prompt = formatted[0] != '\0' ? formatted : prompt;
     request.max_tokens = 8;
     request.temperature = 0.0f;
     request.cpu_path = EDGEXPU_CPU_PATH_LLAMA_BOOTSTRAP;
-    if (!edgexpu_runtime_generate(&runtime, &request, &llama_result, error, sizeof(error))) {
-        fprintf(stderr, "llama bootstrap 对比失败：%s\n", error);
-        edgexpu_runtime_shutdown(&runtime);
-        return 1;
+    request.prompt_is_formatted = formatted[0] != '\0';
+    if (llama == NULL || llama->load == NULL || llama->generate == NULL) {
+        snprintf(llama_error, sizeof(llama_error), "llama bootstrap 不可用");
+    } else if (runtime.manifest.primary_artifact.path[0] == '\0') {
+        if (llama_error[0] == '\0') {
+            snprintf(llama_error, sizeof(llama_error), "compare 无法读取 manifest 或 GGUF");
+        }
+    } else if (llama->load(NULL, &runtime.manifest, llama_error, sizeof(llama_error))) {
+        llama_ok = llama->generate(NULL, &request, &llama_result, llama_error, sizeof(llama_error));
     }
 
     native_total = native_result.telemetry.total_seconds > 0.0
@@ -421,27 +458,35 @@ static int command_compare(const char *manifest_path, const char *prompt) {
     printf("  \"model_id\": \"%s\",\n", runtime.manifest.model_id);
     printf("  \"max_tokens\": 8,\n");
     printf("  \"temperature\": 0.0,\n");
-    print_compare_leg("native", &native_result);
+    print_compare_leg("native", &native_result, native_ok, native_ok ? "" : native_error);
     printf(",\n");
-    print_compare_leg("llama_bootstrap", &llama_result);
+    print_compare_leg("llama_bootstrap", &llama_result, llama_ok, llama_ok ? "" : llama_error);
     printf(",\n");
     printf("  \"comparison\": {\n");
     printf("    \"same_model\": true,\n");
+    printf("    \"native_ok\": %s,\n", native_ok ? "true" : "false");
+    printf("    \"llama_ok\": %s,\n", llama_ok ? "true" : "false");
     printf("    \"native_is_cpu_fallback\": %s,\n",
-           strcmp(native_result.backend, "cpu.native") == 0 ? "true" : "false");
+           native_ok && strcmp(native_result.backend, "cpu.native") == 0 ? "true" : "false");
     printf("    \"llama_is_bootstrap\": %s,\n",
-           strcmp(llama_result.backend, "cpu.baseline") == 0 ? "true" : "false");
+           llama_ok && strcmp(llama_result.backend, "cpu.baseline") == 0 ? "true" : "false");
     printf("    \"native_total_seconds\": %.6f,\n", native_total);
     printf("    \"llama_total_seconds\": %.6f,\n", llama_total);
-    printf("    \"native_faster\": %s,\n", native_total < llama_total ? "true" : "false");
+    printf("    \"native_faster\": %s,\n",
+           native_ok && llama_ok && native_total < llama_total ? "true" : "false");
     printf("    \"completion_tokens_native\": %d,\n", native_result.completion_tokens_approx);
     printf("    \"completion_tokens_llama\": %d,\n", llama_result.completion_tokens_approx);
     printf("    \"texts_required_to_match\": false,\n");
-    printf("    \"notes\": \"Same GGUF greedy check is edgexpu dump-logits vs llama-cli --temp 0 --no-conversation. compare still shells out llama with chat wrapping.\"\n");
+    printf("    \"notes\": \"Product generate never uses llama. compare runs the llama leg even if native load fails. Greedy id check is dump-logits vs llama-cli --temp 0 --no-conversation.\"\n");
     printf("  }\n");
     printf("}\n");
+    fflush(stdout);
 
     edgexpu_runtime_shutdown(&runtime);
+    if (!native_ok && !llama_ok) {
+        fprintf(stderr, "compare 失败：native=%s llama=%s\n", native_error, llama_error);
+        return 1;
+    }
     return 0;
 }
 

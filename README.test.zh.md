@@ -10,14 +10,59 @@
 | 第 4 轮 | 2026-09-03 ~10:50 | 树莓派 4 实机；发现 generate 依赖 llama（P0） |
 | 第 5 轮 | 2026-09-03 ~11:10 | P0 修复后：桌面无 llama PATH + 树莓派产品入口 |
 | 第 6 轮 | 2026-09-03 ~11:30 | v0.0.7：native 成功不再探测 llama；NEON Q4_K；qemu 自动 emulated |
-| **第 7 轮（本次）** | **2026-09-03 ~13:45** | **架构插件 / backend vtable / 资源预算 / 分包 verify.lock；Qwen3.5 识别但不做 native** |
+| 第 7 轮 | 2026-09-03 ~13:45 | 架构插件 / backend vtable / 资源预算；Qwen3.5 识别但不做 native |
+| **第 8 轮（本次）** | **2026-09-03 ~14:05** | **`e135898` 需改规则：产品路径禁止 llama 后备；0.5B 包删除；4B 归位** |
 
 测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
-测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`4d55ab7`）。板上 **无** llama-cli。本轮只记录，不改产品代码。
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`e135898`）。板上 **无** llama-cli。本轮只记录，不改产品代码。SmolLM GGUF 不进 git；板上本无该文件，测试时从桌面拷入 101MB 后才跑通产品入口。
 
 ---
 
-## 0. 第 7 轮结论（`4d55ab7` 修改框架）
+## 0. 第 8 轮结论（`e135898` 需改规则）
+
+规则变成：**产品一律 `cpu.native`；llama 只给 `compare` / `align_llama.sh`。** 未实现的架构必须报缺 adapter，不得改走 llama。Qwen2.5-0.5B 参考包已从仓库去掉；native 参考包是 **SmolLM2-135M**。Qwen3.5 仍 `NATIVE=0`（只锁 tokenize），manifest 改为 `cpu.native`，4B GGUF 已放到 `examples/models/qwen3.5-4b/`。
+
+| 项 | 第 7 轮 | 第 8 轮 |
+| --- | --- | --- |
+| 桌面 `verify_mvp.sh` | 通过（产品包 SmolLM） | **通过**（同上；Qwen3.5 要求 `artifact.backend: cpu.native` + unsupported） |
+| Qwen3.5 `generate`（PATH 上有 llama-cli） | **走 llama**，`[Start thinking]` | **失败**，adapter 错误，exit 1（符合新规则） |
+| Qwen3.5 无 llama | 报缺 llama-cli | **同一句 adapter 错误**（不再提 llama-cli） |
+| 4B 文件位置 | 在 `qwen2.5-0.5b/` 下用 `../` | **已在 `qwen3.5-4b/`** |
+| `EDGEXPU_ARM_FULL=1` | 假绿（空 skip） | **真正跑 SmolLM greedy，通过 1 pack** |
+| 板上 greedy | 0.5B MATCH | **SmolLM MATCH**（拷入 GGUF 后）；拷入前 skip |
+| 板上 `verify_mvp.sh` | 0.5B 产品包 | 无 SmolLM GGUF 时 **红**；拷入后 **通过** |
+| 板上 4B 预算 | admitted=0 | **仍 0**（4351 > 3226） |
+| `edgexpu compare` Qwen3.5 | 未强调 | **两腿独立**：native `ok=false`（缺 SSM）；llama `ok=true`（exit 0）。`generate` 仍失败，不走 llama |
+
+### 第 7 轮 P1 本轮
+
+1. **ARM FULL 假绿：已关。** `load_pack` 用 python 读 JSON 路径，不再 exec aarch64 `BIN`。x86 `EDGEXPU_ARM_FULL=1` 打出 `== smollm2-135m greedy lock` 并 **passed (1 pack)**。脚本在「有 native GGUF 但锁点数对不上」时会 `die`。
+2. **4B 放错目录：已关。** 桌面 / 板均为 `qwen3.5-4b/Qwen3.5-4B-Q8_0.gguf`。
+3. **Qwen3.5 当 llama 产品后端：已关（按新规则）。** 有无 llama-cli 都是 SSM adapter 错误。
+
+### 对得上的行为
+
+- scheduler 只返回 `cpu.native`；load 失败立即返回，不 bind llama。
+- CI：`NATIVE=0` 包仍要 `cpu.native` artifact + `native_adapter=unsupported` + tokenize 锁点 MATCH `9419,10041,55,6126`。
+- 板上 Qwen3.5 generate 报 adapter，不再报缺 llama-cli。
+- chat_template 已带空 `<think>` 块；generate 进不去，无法验收 thinking 行为。
+- README 写明 135M 不要用 2+2→4 当能力线：桌面/板 generate 仍是半句 + `length`。板上 n=32 decode **30.72** / prefill **50.7** tok/s，mem 111MB，swap 未用。HTTP `/v1/models` 为 `smollm2-135m`。
+
+### P2
+
+1. **板上默认没有 native 参考权重。** 删掉 0.5B 包后，仓库里唯一 `NATIVE=1` 的 GGUF 是 SmolLM，且 gitignore。未拷文件时 `verify_mvp.sh` 红。3.3 实机入口依赖自备 135M 文件。
+2. Qwen3.5 SSM 前向仍未实现（已知缺口）。NPU / Windows / soak 未测。executor 仍单线程。
+
+`compare` 已按「llama 只做独立对照」验收：Qwen3.5 native 失败仍跑 llama 腿；SmolLM 两腿都 `ok`。产品 `generate`/`serve` 不依赖 llama。不要把 compare 的 llama 耗时当 native KPI。
+
+### 建议（给开发，测试不改代码）
+
+1. 板上 README/CONTRIBUTING 写清：要跑 `verify_mvp.sh` / generate，必须自备 `SmolLM2-135M-Instruct-Q4_K_M.gguf`。
+2. Qwen3.5 的缺口是 `src/arch/qwen35` 的 SSM 前向，不是再接 llama 当产品后端。
+
+---
+
+## 0a. 第 7 轮结论（`4d55ab7` 修改框架，归档）
 
 新框架按 `CONTRIBUTING.md` 拆开了三层：**模型包**（`examples/models/<pack>/` + `verify.lock`）、**架构插件**（`src/arch/*.c`）、**backend vtable**（`cpu.native` 分步 vs llama 一次性 `generate`）。scheduler 按 mmap 权重 + KV + scratch 估预算，超过设备 RAM **85%** 拒绝 native load。Qwen3.5 hybrid **只识别、不跑 cpu.native**。
 
@@ -284,8 +329,8 @@ verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿（需 0.5B GGUF）
 1. 第 5–6 轮已关 P0。板上 tok/s 仅记录；不要拿它和桌面或 llama 比达标。
 2. qemu-user 现在会自动标 `emulated=true`；`verify_arm.sh` 仍会设 `EDGEXPU_EMULATED=1`。
 3. 不要把第 3 轮桌面满载 9–20 tok/s 写进计划当回归。
-4. 4B 权重量放到 `qwen3.5-4b/`；桌面补回 0.5B 文件名，否则 CI 产品包会变成 SmolLM。
-5. x86 上 `EDGEXPU_ARM_FULL=1` 必须真正跑到 dump-logits，不能 skip 当通过。
+4. 4B 已在 `qwen3.5-4b/`。板上要跑产品入口需自备 SmolLM GGUF。
+5. 第 8 轮：`EDGEXPU_ARM_FULL=1` 已真正锁 SmolLM。`compare` 两腿独立；产品路径不用 llama。
 
 ---
 

@@ -6,6 +6,9 @@
 # Full GGUF lock under qemu is slow; set EDGEXPU_ARM_FULL=1 to run dump-logits n=4.
 #
 # Pi 5 on-device: cmake -DEDGEXPU_ARM_DOTPROD=ON
+# Pi / ARM greedy and verify_mvp.sh need SmolLM2-135M-Instruct-Q4_K_M.gguf under
+# examples/models/smollm2-135m/ (gitignored). Missing file skips the pack; verify_mvp.sh
+# then fails because there is no NATIVE=1 product pack.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -112,6 +115,7 @@ if [[ "${EDGEXPU_ARM_FULL:-0}" == "1" || "${HOST_ARCH}" == "aarch64" || "${HOST_
     fi
     if [[ "${LOCKED}" -lt 1 ]]; then
         echo "skip GGUF greedy lock: no native pack with GGUF + verify.lock"
+        echo "on-device: copy SmolLM2-135M-Instruct-Q4_K_M.gguf to examples/models/smollm2-135m/ (not in git)"
     else
         echo "ARM greedy lock passed (${LOCKED} pack(s))"
     fi

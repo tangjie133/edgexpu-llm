@@ -47,7 +47,7 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 - 贡献入口 `CONTRIBUTING.md` 与 `examples/models/_template/`
 - MVP 验证脚本 `scripts/verify_mvp.sh`
 
-本地 benchmark 路径已经用 GGUF 模型和 native CPU prefill/decode 验证通过。runtime 通过单线程 runnable executor queue 执行 load、tokenize、prefill、decode、KV cache、stream 和 telemetry job。`tokenize` 走 native GGUF BPE tokenizer；`prefill` 跑完全部 transformer 层并写入 KV；每个生成 token 对应一次 native `decode_step` 和一次 `stream_token`。`llama cli` 仅在 native session 未就绪时作为后备。benchmark 会输出 `backend_telemetry`（含 prefill/decode 分项时间）、queue summary、scheduler policy 和 `executor_trace`。
+本地 benchmark 路径已经用 GGUF 模型和 native CPU prefill/decode 验证通过。runtime 通过单线程 runnable executor queue 执行 load、tokenize、prefill、decode、KV cache、stream 和 telemetry job。`tokenize` 走 native GGUF BPE tokenizer；`prefill` 跑完全部 transformer 层并写入 KV；每个生成 token 对应一次 native `decode_step` 和一次 `stream_token`。`generate` / `serve` 不回退 llama。benchmark 会输出 `backend_telemetry`（含 prefill/decode 分项时间）、queue summary、scheduler policy 和 `executor_trace`。
 
 ## 总体架构
 
@@ -248,7 +248,7 @@ MVP 要保持小而可验证。
 
 | 目录 | 角色 |
 | --- | --- |
-| `examples/models/smollm2-135m/` | **native 参考包**（adapter=`llama`）。`cpu.native`；greedy n=4 锁在该目录 `verify.lock`。135M 质量有限，不要用 2+2→4 当能力验收。 |
+| `examples/models/smollm2-135m/` | **native 参考包**（adapter=`llama`）。`cpu.native`；greedy n=4 锁在该目录 `verify.lock`。权重 `SmolLM2-135M-Instruct-Q4_K_M.gguf` **不进 git**（`*.gguf` gitignore）。要跑 `generate` / `verify_mvp.sh` / ARM FULL，必须把该文件放到本目录。135M 质量有限，不要用 2+2→4 当能力验收。 |
 | `examples/models/qwen3.5-4b/` | 同一套 `cpu.native` 契约。hybrid Attention+SSM **尚未实现**，所以 CI 只锁 tokenize；`generate` 会报缺 adapter，不改走 llama。GGUF context 262144，包内 `context_length=8192` 是边缘调度窗。Pi 4GB 会被资源预算拒绝 mmap。 |
 
 加包方式见 `CONTRIBUTING.md`。不要把其它权重塞进已删除的 Qwen2.5-0.5B 目录。
@@ -261,7 +261,7 @@ cmake --build build --config Release
 bash scripts/verify_mvp.sh
 ```
 
-日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。缺 GGUF 的包会跳过，不把 CI 钉死在某一个文件名上。加模型或架构见 `CONTRIBUTING.md`。
+日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。某一个包缺 GGUF 会 skip 该包；但至少要有一包 `NATIVE=1` 且 GGUF 在位，否则 `verify_mvp.sh` 无法跑 generate/serve。空板需要先拷贝 SmolLM 权重。加模型或架构见 `CONTRIBUTING.md`。
 
 llama.cpp 只是可选对照，不进默认验证：
 
@@ -269,7 +269,7 @@ llama.cpp 只是可选对照，不进默认验证：
 bash scripts/align_llama.sh              # greedy id vs llama-cli --no-conversation
 bash scripts/bench_cpu.sh                # 公平 CPU tok/s，n=32，隐藏 GPU
 ./build/edgexpu generate <manifest> "<prompt>" 32   # 纯文本；finish_reason 打在 stderr
-./build/edgexpu compare <manifest> <prompt>   # 临时 bootstrap 耗时对比，会 shell-out
+./build/edgexpu compare <manifest> <prompt>   # native 与 llama 两腿独立；native load 失败仍跑 llama
 ./build/edgexpu benchmark <manifest> "<prompt>" 32
 ```
 
@@ -277,8 +277,8 @@ Phase 3.3 ARM / NEON（不进 `verify_mvp.sh`，无相对 llama 的 tok/s 线）
 
 ```bash
 sudo apt install gcc-aarch64-linux-gnu qemu-user-static   # 仅 x86 交叉编译需要
-bash scripts/verify_arm.sh                                # 交叉编译 + qemu unit；板上直接跑 greedy 锁点
-# EDGEXPU_ARM_FULL=1 bash scripts/verify_arm.sh           # x86 上 qemu 跑参考包 greedy（慢）
+bash scripts/verify_arm.sh                                # 交叉编译 + qemu unit；板上 greedy 需自备 SmolLM GGUF
+# EDGEXPU_ARM_FULL=1 bash scripts/verify_arm.sh           # x86 上 qemu 跑参考包 greedy（慢；同样需要该 GGUF）
 # 树莓派 5 本机构建再加：-DEDGEXPU_ARM_DOTPROD=ON
 ```
 

@@ -119,7 +119,7 @@ while IFS= read -r pack_dir; do
 done < <(each_pack_dir)
 
 if [[ "${NATIVE_PACKS}" -lt 1 || -z "${NATIVE_MANIFEST}" ]]; then
-    die "no native-capable model pack with GGUF + verify.lock (need cpu.native for generate/serve)"
+    die "no native-capable pack with GGUF (copy SmolLM2-135M-Instruct-Q4_K_M.gguf into examples/models/smollm2-135m/; *.gguf is gitignored)"
 fi
 echo "product pack: ${NATIVE_MANIFEST} (${NATIVE_MODEL_ID})"
 

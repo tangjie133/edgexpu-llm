@@ -19,7 +19,8 @@ EdgeXPU-LLM 是边缘离线 LLM runtime。开源后请按层改代码，不要�
 - `model.manifest.json`：`model_id`、artifact `path` / `backend`、`chat_template`
 - `verify.lock`：`ADAPTER`、`NATIVE`、`PROMPT_IDS`、可选 `GREEDY_IDS`
 - 共享 prompt：`scripts/verify.locks`（`PROMPT` / `GREEDY_N`）
-- 缺 GGUF 时 `scripts/verify_mvp.sh` 会 skip 该包，不会红
+- `*.gguf` 不进 git。缺某个包的 GGUF 时 `scripts/verify_mvp.sh` 会 skip **该包**
+- 全仓库至少要有一包 `NATIVE=1` 且 GGUF 在位，否则 `verify_mvp.sh` 红（generate/serve 没有产品包）。板上请把 `SmolLM2-135M-Instruct-Q4_K_M.gguf` 放到 `examples/models/smollm2-135m/`
 
 产品执行**一律** `cpu.native`。llama.cpp 只给 `compare` / `align_llama.sh` 对照，不是某一类模型的正式后端。
 
@@ -37,7 +38,7 @@ Qwen3.5 目前是 `NATIVE=0`：能分词，还不能自研 SSM 前向。缺口�
 
 ## Backend 插件
 
-`include/edgexpu/backend.h`：产品 backend 是 `cpu.native` 的分步接口。llama bootstrap 只给 `edgexpu compare` 用。
+`include/edgexpu/backend.h`：产品 backend 是 `cpu.native` 的分步接口。llama bootstrap 只给 `edgexpu compare` 用；compare 在 native load 失败时仍跑 llama 腿，`generate`/`serve` 不会。
 
 ## 资源调度
 
@@ -50,5 +51,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 bash scripts/verify_mvp.sh
 ```
+
+树莓派 clone 后没有权重。把 `SmolLM2-135M-Instruct-Q4_K_M.gguf` 放到 `examples/models/smollm2-135m/` 再跑 `verify_mvp.sh` 或 `verify_arm.sh`。缺这个文件时脚本红，不是 runtime 回退到 llama。
 
 不要把 llama.cpp 写进默认 CI。对照数值用 `scripts/align_llama.sh`。
