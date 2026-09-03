@@ -2,6 +2,7 @@
 #define EDGEXPU_BACKEND_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "edgexpu/manifest.h"
 
@@ -9,23 +10,23 @@
 extern "C" {
 #endif
 
-/* Backend 契约：可用性检查、加载 artifact、执行一次生成。
- * cpu.native 由 runtime 内部 native session 实现；这里的 cpu.baseline 是 llama.cpp shell-out。
+/* Backend 插件契约。engine 对 cpu.native 是 edgexpu_native_session*，对 llama 可为空。
+ * 分步接口（tokenize/prefill/decode_step）为 NULL 时，runtime 走一次性 generate()。
  */
 
 typedef enum edgexpu_cpu_path {
-    EDGEXPU_CPU_PATH_AUTO = 0,           /* native 就绪则走 native，否则 llama bootstrap */
-    EDGEXPU_CPU_PATH_NATIVE = 1,         /* 强制 native CPU fallback */
-    EDGEXPU_CPU_PATH_LLAMA_BOOTSTRAP = 2 /* 强制临时 llama CLI */
+    EDGEXPU_CPU_PATH_AUTO = 0,
+    EDGEXPU_CPU_PATH_NATIVE = 1,
+    EDGEXPU_CPU_PATH_LLAMA_BOOTSTRAP = 2
 } edgexpu_cpu_path;
 
 typedef struct edgexpu_generation_request {
     const char *prompt;
     int max_tokens;
     float temperature;
-    float top_p; /* <=0 或 >=1 表示不截断；temperature≈0 时忽略，走 greedy */
+    float top_p;
     edgexpu_cpu_path cpu_path;
-    int prompt_is_formatted; /* HTTP 已按 messages 套模板，runtime 不再套一层 */
+    int prompt_is_formatted;
 } edgexpu_generation_request;
 
 typedef struct edgexpu_backend_telemetry {
@@ -37,13 +38,13 @@ typedef struct edgexpu_backend_telemetry {
     double decode_seconds;
     int prompt_tokens_approx;
     int completion_tokens_approx;
-    int memory_used_mb; /* mmap 权重大小 + KV，向上取整到 MB */
+    int memory_used_mb;
 } edgexpu_backend_telemetry;
 
 typedef struct edgexpu_generation_result {
     char text[EDGEXPU_TEXT_PROMPT];
     char backend[EDGEXPU_TEXT_SMALL];
-    char finish_reason[EDGEXPU_TEXT_SMALL]; /* stop | length */
+    char finish_reason[EDGEXPU_TEXT_SMALL];
     double elapsed_seconds;
     int prompt_tokens_approx;
     int completion_tokens_approx;
@@ -52,33 +53,40 @@ typedef struct edgexpu_generation_result {
 
 typedef struct edgexpu_backend {
     const char *name;
-
-    /* 检查 backend 是否可用，例如二进制是否存在、runtime 是否安装。 */
     int (*is_available)(void);
-
-    /* 加载模型 artifact。初版只保存 manifest 信息，不做常驻模型池。 */
     int (*load)(
+        void *engine,
         const edgexpu_model_manifest *manifest,
         char *error,
         size_t error_size
     );
-
-    /* 执行一次生成。
-     * 当前同步接口是 MVP 门面；后续内部应拆成异步 load/prefill/decode/KV/stream jobs，
-     * 由调度器在 CPU、NPU、dNPU 和 flash/memory 管线之间编排。
-     */
     int (*generate)(
+        void *engine,
         const edgexpu_generation_request *request,
         edgexpu_generation_result *result,
         char *error,
         size_t error_size
     );
+    int (*tokenize)(void *engine, const char *text, char *error, size_t error_size);
+    int (*ensure_window)(void *engine, int n_prompt, int n_new, char *error, size_t error_size);
+    int (*prefill)(void *engine, char *error, size_t error_size);
+    int (*reserve_kv)(void *engine, int tokens, char *error, size_t error_size);
+    int (*decode_step)(
+        void *engine,
+        float temperature,
+        float top_p,
+        uint32_t *token_id,
+        char *piece,
+        size_t piece_size,
+        int *stopped,
+        char *error,
+        size_t error_size
+    );
 } edgexpu_backend;
 
-/* 返回临时 CPU bootstrap backend。它对应 PowerInfer/llama.cpp 风格的本地二进制调用。 */
 const edgexpu_backend *edgexpu_backend_cpu_baseline(void);
+const edgexpu_backend *edgexpu_backend_cpu_native(void);
 
-/* 只记住 manifest，不探测 PATH。native 成功时用；llama generate 再真正 load。 */
 void edgexpu_backend_cpu_baseline_bind(const edgexpu_model_manifest *manifest);
 
 #ifdef __cplusplus

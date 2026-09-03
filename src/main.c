@@ -732,6 +732,51 @@ static int command_scheduler_selftest(void) {
         }
     }
 
+    {
+        edgexpu_device_profile tiny;
+        edgexpu_resource_plan plan;
+        memset(&tiny, 0, sizeof(tiny));
+        tiny.memory_total_mb = 256;
+        edgexpu_scheduler_estimate_native(
+            4ull * 1024ull * 1024ull * 1024ull,
+            32,
+            8,
+            128,
+            4096,
+            11008,
+            32,
+            4096,
+            &tiny,
+            &plan
+        );
+        if (plan.admitted || edgexpu_scheduler_admit(&plan, error, sizeof(error))) {
+            fprintf(stderr, "scheduler selftest failed: huge model should be rejected on 256MB device\n");
+            return 1;
+        }
+        if (strstr(plan.reason, "exceeds") == NULL) {
+            fprintf(stderr, "scheduler selftest failed: budget reject reason: %s\n", plan.reason);
+            return 1;
+        }
+        tiny.memory_total_mb = 8192;
+        edgexpu_scheduler_estimate_native(
+            80ull * 1024ull * 1024ull,
+            30,
+            3,
+            64,
+            576,
+            1536,
+            9,
+            256,
+            &tiny,
+            &plan
+        );
+        if (!plan.admitted || !edgexpu_scheduler_admit(&plan, error, sizeof(error))) {
+            fprintf(stderr, "scheduler selftest failed: small model should be admitted: %s\n", plan.reason);
+            return 1;
+        }
+        printf("budget_reject=ok budget_admit=ok\n");
+    }
+
     printf("scheduler selftest passed\n");
     return 0;
 }
@@ -767,6 +812,24 @@ static int command_inspect_gguf(const char *gguf_path) {
     printf("vocab_size=%u\n", tokenizer.vocab_size);
     printf("n_merges=%u\n", tokenizer.n_merges);
     printf("eos=%u pad=%u\n", info.eos_token_id, info.pad_token_id);
+    {
+        edgexpu_device_profile profile;
+        edgexpu_resource_plan plan;
+        int window = EDGEXPU_KV_DEFAULT_MAX_SEQ;
+        memset(&profile, 0, sizeof(profile));
+        (void)edgexpu_profile_device(&profile);
+        if (info.context_length > 0 && (int)info.context_length < window) {
+            window = (int)info.context_length;
+        }
+        edgexpu_scheduler_estimate_gguf(&info, &profile, window, &plan);
+        printf(
+            "budget_admitted=%d total_mb=%zu limit_mb=%zu window=%d\n",
+            plan.admitted,
+            plan.total_bytes / (1024u * 1024u),
+            plan.limit_bytes / (1024u * 1024u),
+            plan.window
+        );
+    }
 
     if (!edgexpu_arch_from_gguf(&info, &adapter, error, sizeof(error))) {
         printf("native_adapter=unsupported\n");
@@ -775,12 +838,14 @@ static int command_inspect_gguf(const char *gguf_path) {
         edgexpu_tokenizer_free(&tokenizer);
         return 0;
     }
-    printf("adapter=%s qkv_bias=%d rope=%s ffn=%s tokenizer=%s\n",
+    printf("adapter=%s plugin=%s qkv_bias=%d rope=%s ffn=%s tokenizer=%s native_forward=%d\n",
            adapter.name,
+           adapter.plugin != NULL ? adapter.plugin->id : adapter.name,
            adapter.has_qkv_bias,
            edgexpu_rope_type_name(adapter.rope),
            edgexpu_ffn_type_name(adapter.ffn),
-           edgexpu_tokenizer_kind_name(adapter.tokenizer));
+           edgexpu_tokenizer_kind_name(adapter.tokenizer),
+           adapter.native_forward);
     edgexpu_gguf_info_free(&info);
     edgexpu_tokenizer_free(&tokenizer);
     return 0;

@@ -14,8 +14,13 @@ endif()
 include(CheckCCompilerFlag)
 
 add_library(edgexpu_runtime
-    src/arch.c
+    src/arch/llama.c
+    src/arch/qwen2.c
+    src/arch/qwen35.c
+    src/arch/register.c
+    src/arch/tensors.c
     src/backend.c
+    src/backend_native.c
     src/chat.c
     src/cpu_kernel.c
     src/executor.c

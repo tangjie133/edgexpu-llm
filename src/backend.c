@@ -321,12 +321,14 @@ static int cpu_baseline_available(void) {
 }
 
 static int cpu_baseline_load(
+    void *engine,
     const edgexpu_model_manifest *manifest,
     char *error,
     size_t error_size
 ) {
     const char *command;
 
+    (void)engine;
     if (manifest == NULL) {
         set_error(error, error_size, "backend 加载失败：manifest 为空");
         return 0;
@@ -352,11 +354,13 @@ static int cpu_baseline_load(
 }
 
 static int cpu_baseline_generate(
+    void *engine,
     const edgexpu_generation_request *request,
     edgexpu_generation_result *result,
     char *error,
     size_t error_size
 ) {
+    (void)engine;
     const char *command;
     char shell_command[EDGEXPU_TEXT_LARGE * 3];
     char command_prefix[EDGEXPU_TEXT_MEDIUM + 8];
@@ -371,7 +375,7 @@ static int cpu_baseline_generate(
     const char *extra_args;
 
     if (!g_loaded) {
-        if (!cpu_baseline_load(&g_loaded_manifest, error, error_size)) {
+        if (!cpu_baseline_load(NULL, &g_loaded_manifest, error, error_size)) {
             return 0;
         }
     }
@@ -482,10 +486,15 @@ static int cpu_baseline_generate(
 
 const edgexpu_backend *edgexpu_backend_cpu_baseline(void) {
     static const edgexpu_backend backend = {
-        "cpu.baseline",
-        cpu_baseline_available,
-        cpu_baseline_load,
-        cpu_baseline_generate
+        .name = "cpu.baseline",
+        .is_available = cpu_baseline_available,
+        .load = cpu_baseline_load,
+        .generate = cpu_baseline_generate,
+        .tokenize = NULL,
+        .ensure_window = NULL,
+        .prefill = NULL,
+        .reserve_kv = NULL,
+        .decode_step = NULL
     };
     return &backend;
 }

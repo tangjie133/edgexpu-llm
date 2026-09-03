@@ -5,18 +5,16 @@
 
 #include "edgexpu/backend.h"
 #include "edgexpu/executor.h"
+#include "edgexpu/gguf.h"
 #include "edgexpu/manifest.h"
 #include "edgexpu/profiler.h"
+
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* 按 job 类型、设备能力和最近 telemetry 给出执行决策。
- * 初版仍主要落到 CPU；NPU/dNPU 路由是后续阶段。
- */
-
-/* native 路径各子系统是否已就绪，供 plan 决定 tokenize/prefill/decode 走哪条 backend。 */
 typedef struct edgexpu_schedule_native_ready {
     int loader;
     int tokenizer;
@@ -33,9 +31,45 @@ typedef struct edgexpu_schedule_decision {
     char fallback_reason[EDGEXPU_TEXT_MEDIUM];
 } edgexpu_schedule_decision;
 
-/* 初版调度器仍只选择一个 backend；job 级 decision 是后续异构调度入口。 */
+typedef struct edgexpu_resource_plan {
+    size_t weight_bytes;
+    size_t kv_bytes;
+    size_t scratch_bytes;
+    size_t total_bytes;
+    size_t limit_bytes;
+    int window;
+    int admitted;
+    char reason[EDGEXPU_TEXT_MEDIUM];
+} edgexpu_resource_plan;
+
 const edgexpu_backend *edgexpu_scheduler_select_backend(
     const edgexpu_model_manifest *manifest,
+    char *error,
+    size_t error_size
+);
+
+void edgexpu_scheduler_estimate_native(
+    uint64_t file_size,
+    uint32_t block_count,
+    uint32_t n_kv_heads,
+    int head_dim,
+    uint32_t n_embd,
+    uint32_t n_ff,
+    uint32_t n_heads,
+    int window,
+    const edgexpu_device_profile *profile,
+    edgexpu_resource_plan *plan
+);
+
+void edgexpu_scheduler_estimate_gguf(
+    const edgexpu_gguf_info *info,
+    const edgexpu_device_profile *profile,
+    int window,
+    edgexpu_resource_plan *plan
+);
+
+int edgexpu_scheduler_admit(
+    const edgexpu_resource_plan *plan,
     char *error,
     size_t error_size
 );

@@ -1,3 +1,4 @@
+#include "edgexpu/arch.h"
 #include "edgexpu/cpu_kernel.h"
 #include "edgexpu/profiler.h"
 
@@ -140,8 +141,19 @@ void edgexpu_profile_print_json(const edgexpu_device_profile *profile) {
     printf("  \"emulated\": %s,\n", profile->emulated ? "true" : "false");
     printf("  \"runtimes\": {\n");
     printf("    \"cpu_baseline\": %s,\n", profile->has_llama_cli ? "true" : "false");
+    printf("    \"cpu_native\": true,\n");
     printf("    \"rockchip\": %s,\n", profile->has_rockchip_runtime ? "true" : "false");
     printf("    \"qualcomm\": %s\n", profile->has_qualcomm_runtime ? "true" : "false");
-    printf("  }\n");
+    printf("  },\n");
+    printf("  \"arch_plugins\": [");
+    {
+        int i;
+        int n = edgexpu_arch_plugin_count();
+        for (i = 0; i < n; i++) {
+            const edgexpu_arch_plugin *plugin = edgexpu_arch_plugin_at(i);
+            printf("%s\"%s\"", i == 0 ? "" : ", ", plugin != NULL ? plugin->id : "");
+        }
+    }
+    printf("]\n");
     printf("}\n");
 }

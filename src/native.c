@@ -3,6 +3,8 @@
 #include "edgexpu/chat.h"
 #include "edgexpu/cpu_kernel.h"
 #include "edgexpu/gguf_quant.h"
+#include "edgexpu/profiler.h"
+#include "edgexpu/scheduler.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -32,6 +34,28 @@ static void set_error(char *error, size_t error_size, const char *message) {
 
 static int native_context_length(const edgexpu_native_session *session);
 static int ensure_token_ids(edgexpu_native_session *session, int cap, char *error, size_t error_size);
+
+static const edgexpu_arch_tensor_names *session_tensors(const edgexpu_native_session *session) {
+    if (session != NULL && session->arch.tensors != NULL) {
+        return session->arch.tensors;
+    }
+    return edgexpu_arch_tensors_llama_gguf();
+}
+
+static int admit_session_window(
+    const edgexpu_native_session *session,
+    int window,
+    char *error,
+    size_t error_size
+) {
+    edgexpu_device_profile profile;
+    edgexpu_resource_plan plan;
+
+    memset(&profile, 0, sizeof(profile));
+    (void)edgexpu_profile_device(&profile);
+    edgexpu_scheduler_estimate_gguf(&session->gguf, &profile, window, &plan);
+    return edgexpu_scheduler_admit(&plan, error, error_size);
+}
 
 static void native_unmap(edgexpu_native_session *session) {
     if (session == NULL) {
@@ -147,16 +171,18 @@ static void apply_rope(
 }
 
 static const edgexpu_gguf_tensor *token_embedding_tensor(const edgexpu_native_session *session) {
-    return session == NULL ? NULL : edgexpu_gguf_find_tensor(&session->gguf, "token_embd.weight");
+    const edgexpu_arch_tensor_names *names = session_tensors(session);
+    return session == NULL ? NULL : edgexpu_gguf_find_tensor(&session->gguf, names->token_embd);
 }
 
 /* 有独立 output.weight 则用它算 logits，否则 tied embedding。 */
 static const edgexpu_gguf_tensor *logit_weight_tensor(const edgexpu_native_session *session) {
     const edgexpu_gguf_tensor *output;
+    const edgexpu_arch_tensor_names *names = session_tensors(session);
     if (session == NULL) {
         return NULL;
     }
-    output = edgexpu_gguf_find_tensor(&session->gguf, "output.weight");
+    output = edgexpu_gguf_find_tensor(&session->gguf, names->output_weight);
     if (output != NULL) {
         return output;
     }
@@ -404,7 +430,13 @@ static int load_layer_into(
     char *error,
     size_t error_size
 ) {
+    const edgexpu_arch_tensor_names *names = session_tensors(session);
     char name[96];
+
+    if (edgexpu_arch_layer_kind(&session->arch, &session->gguf, layer_index) != EDGEXPU_LAYER_ATTN_SWIGLU) {
+        snprintf(error, error_size, "layer %d 不是 cpu.native 已实现的 ATTN+SwiGLU block", layer_index);
+        return 0;
+    }
 
     layer_free(layer);
     layer->n_embd = (int)session->gguf.embedding_length;
@@ -418,71 +450,79 @@ static int load_layer_into(
         return 0;
     }
 
-#define LOAD_BLK(field, suffix) \
+#define LOAD_BLK(field, tmpl) \
     do { \
-        snprintf(name, sizeof(name), "blk.%d.%s", layer_index, suffix); \
+        if (!edgexpu_arch_format_name(name, sizeof(name), (tmpl), layer_index)) { \
+            set_error(error, error_size, "tensor 名过长"); \
+            layer_free(layer); \
+            return 0; \
+        } \
         if (!load_named_weight(session, name, &layer->field, error, error_size)) { \
             layer_free(layer); \
             return 0; \
         } \
     } while (0)
 
-#define LOAD_Q(field, suffix, nout, nin) \
+#define LOAD_Q(field, tmpl, nout, nin) \
     do { \
-        snprintf(name, sizeof(name), "blk.%d.%s", layer_index, suffix); \
+        if (!edgexpu_arch_format_name(name, sizeof(name), (tmpl), layer_index)) { \
+            set_error(error, error_size, "tensor 名过长"); \
+            layer_free(layer); \
+            return 0; \
+        } \
         if (!load_qweight(session, name, (nout), (nin), &layer->field, error, error_size)) { \
             layer_free(layer); \
             return 0; \
         } \
     } while (0)
 
-    LOAD_BLK(attn_norm, "attn_norm.weight");
-    LOAD_BLK(ffn_norm, "ffn_norm.weight");
-    LOAD_Q(wq, "attn_q.weight", layer->n_embd, layer->n_embd);
-    LOAD_Q(wk, "attn_k.weight", layer->n_kv_heads * layer->head_dim, layer->n_embd);
-    LOAD_Q(wv, "attn_v.weight", layer->n_kv_heads * layer->head_dim, layer->n_embd);
-    LOAD_Q(wo, "attn_output.weight", layer->n_embd, layer->n_embd);
-    LOAD_Q(wgate, "ffn_gate.weight", layer->n_ff, layer->n_embd);
-    LOAD_Q(wup, "ffn_up.weight", layer->n_ff, layer->n_embd);
-    LOAD_Q(wdown, "ffn_down.weight", layer->n_embd, layer->n_ff);
+    LOAD_BLK(attn_norm, names->attn_norm);
+    LOAD_BLK(ffn_norm, names->ffn_norm);
+    LOAD_Q(wq, names->attn_q, layer->n_embd, layer->n_embd);
+    LOAD_Q(wk, names->attn_k, layer->n_kv_heads * layer->head_dim, layer->n_embd);
+    LOAD_Q(wv, names->attn_v, layer->n_kv_heads * layer->head_dim, layer->n_embd);
+    LOAD_Q(wo, names->attn_output, layer->n_embd, layer->n_embd);
+    LOAD_Q(wgate, names->ffn_gate, layer->n_ff, layer->n_embd);
+    LOAD_Q(wup, names->ffn_up, layer->n_ff, layer->n_embd);
+    LOAD_Q(wdown, names->ffn_down, layer->n_embd, layer->n_ff);
     if (session->arch.has_qkv_bias) {
-        LOAD_BLK(bq, "attn_q.bias");
-        LOAD_BLK(bk, "attn_k.bias");
-        LOAD_BLK(bv, "attn_v.bias");
+        LOAD_BLK(bq, names->attn_q_bias);
+        LOAD_BLK(bk, names->attn_k_bias);
+        LOAD_BLK(bv, names->attn_v_bias);
     } else {
-        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", layer_index);
-        if (!load_named_weight_optional(session, name, &layer->bq, error, error_size)) {
+        if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_q_bias, layer_index) ||
+            !load_named_weight_optional(session, name, &layer->bq, error, error_size)) {
             layer_free(layer);
             return 0;
         }
-        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", layer_index);
-        if (!load_named_weight_optional(session, name, &layer->bk, error, error_size)) {
+        if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_k_bias, layer_index) ||
+            !load_named_weight_optional(session, name, &layer->bk, error, error_size)) {
             layer_free(layer);
             return 0;
         }
-        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", layer_index);
-        if (!load_named_weight_optional(session, name, &layer->bv, error, error_size)) {
+        if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_v_bias, layer_index) ||
+            !load_named_weight_optional(session, name, &layer->bv, error, error_size)) {
             layer_free(layer);
             return 0;
         }
     }
-    snprintf(name, sizeof(name), "blk.%d.attn_output.bias", layer_index);
-    if (!load_named_weight_optional(session, name, &layer->bo, error, error_size)) {
+    if (!edgexpu_arch_format_name(name, sizeof(name), names->attn_output_bias, layer_index) ||
+        !load_named_weight_optional(session, name, &layer->bo, error, error_size)) {
         layer_free(layer);
         return 0;
     }
-    snprintf(name, sizeof(name), "blk.%d.ffn_gate.bias", layer_index);
-    if (!load_named_weight_optional(session, name, &layer->bgate, error, error_size)) {
+    if (!edgexpu_arch_format_name(name, sizeof(name), names->ffn_gate_bias, layer_index) ||
+        !load_named_weight_optional(session, name, &layer->bgate, error, error_size)) {
         layer_free(layer);
         return 0;
     }
-    snprintf(name, sizeof(name), "blk.%d.ffn_up.bias", layer_index);
-    if (!load_named_weight_optional(session, name, &layer->bup, error, error_size)) {
+    if (!edgexpu_arch_format_name(name, sizeof(name), names->ffn_up_bias, layer_index) ||
+        !load_named_weight_optional(session, name, &layer->bup, error, error_size)) {
         layer_free(layer);
         return 0;
     }
-    snprintf(name, sizeof(name), "blk.%d.ffn_down.bias", layer_index);
-    if (!load_named_weight_optional(session, name, &layer->bdown, error, error_size)) {
+    if (!edgexpu_arch_format_name(name, sizeof(name), names->ffn_down_bias, layer_index) ||
+        !load_named_weight_optional(session, name, &layer->bdown, error, error_size)) {
         layer_free(layer);
         return 0;
     }
@@ -754,16 +794,21 @@ int edgexpu_native_load(
         return 0;
     }
 
-    if (!native_map_file(session, gguf_path, error, error_size)) {
-        edgexpu_native_free(session);
-        return 0;
-    }
-
     head_dim = edgexpu_gguf_head_dim(&session->gguf);
     max_seq = EDGEXPU_KV_DEFAULT_MAX_SEQ;
     if (session->gguf.context_length > 0 && (int)session->gguf.context_length < max_seq) {
         max_seq = (int)session->gguf.context_length;
     }
+    if (!admit_session_window(session, max_seq, error, error_size)) {
+        edgexpu_native_free(session);
+        return 0;
+    }
+
+    if (!native_map_file(session, gguf_path, error, error_size)) {
+        edgexpu_native_free(session);
+        return 0;
+    }
+
     if (session->gguf.block_count > 0 && session->gguf.head_count_kv > 0 && head_dim > 0) {
         if (!edgexpu_kv_cache_allocate(
                 &session->kv,
@@ -782,11 +827,11 @@ int edgexpu_native_load(
         edgexpu_native_free(session);
         return 0;
     }
-    if (!load_named_weight(session, "output_norm.weight", &session->output_norm, error, error_size)) {
+    if (!load_named_weight(session, session_tensors(session)->output_norm, &session->output_norm, error, error_size)) {
         edgexpu_native_free(session);
         return 0;
     }
-    if (!load_named_weight_optional(session, "output.bias", &session->output_bias, error, error_size)) {
+    if (!load_named_weight_optional(session, session_tensors(session)->output_bias, &session->output_bias, error, error_size)) {
         edgexpu_native_free(session);
         return 0;
     }
@@ -908,6 +953,9 @@ int edgexpu_native_ensure_window(
     }
     if (needed < 1) {
         needed = 1;
+    }
+    if (!admit_session_window(session, needed, error, error_size)) {
+        return 0;
     }
     if (!ensure_token_ids(session, context, error, error_size)) {
         return 0;
@@ -1892,6 +1940,21 @@ int edgexpu_native_selftest(const char *gguf_path) {
         fprintf(stderr, "native layer0 was not loaded\n");
         edgexpu_native_free(&session);
         return 1;
+    }
+    {
+        edgexpu_device_profile profile;
+        edgexpu_resource_plan plan;
+        memset(&profile, 0, sizeof(profile));
+        (void)edgexpu_profile_device(&profile);
+        edgexpu_scheduler_estimate_gguf(&session.gguf, &profile, session.kv.max_seq > 0 ? session.kv.max_seq : EDGEXPU_KV_DEFAULT_MAX_SEQ, &plan);
+        printf(
+            "budget_admitted=%d total_mb=%zu limit_mb=%zu window=%d plugin=%s\n",
+            plan.admitted,
+            plan.total_bytes / (1024u * 1024u),
+            plan.limit_bytes / (1024u * 1024u),
+            plan.window,
+            session.arch.plugin != NULL ? session.arch.plugin->id : session.arch.name
+        );
     }
     if (!edgexpu_native_tokenize(&session, "Hello EdgeXPU", error, sizeof(error)) ||
         session.token_count <= 0) {

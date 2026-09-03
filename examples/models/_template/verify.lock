@@ -1,0 +1,5 @@
+# Copy to a real pack directory. Missing model.gguf → verify_mvp.sh skips this pack.
+ADAPTER=llama
+NATIVE=1
+PROMPT_IDS=
+GREEDY_IDS=

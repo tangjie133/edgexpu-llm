@@ -83,6 +83,9 @@ require_contains "${UNIT}" "native selftest passed" "kernel native-selftest"
 if [[ "${EDGEXPU_ARM_FULL:-0}" == "1" || "${HOST_ARCH}" == "aarch64" || "${HOST_ARCH}" == "arm64" ]]; then
     LOCKED=0
     while IFS= read -r pack_dir; do
+        if [[ "$(basename "${pack_dir}")" == "_template" ]]; then
+            continue
+        fi
         if ! load_pack "${pack_dir}"; then
             continue
         fi

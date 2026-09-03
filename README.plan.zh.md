@@ -26,7 +26,15 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 
 验证脚本扫描 `examples/models/*/verify.lock`；禁止把 `qwen2.5`、24 层、`<|im_start|>` 写进 runtime 核心路径。chat template、特殊 token、RoPE 变体属于架构适配器或模型包字段。
 
-后续加模型的正确方式：新增一个 model pack 目录 + manifest。若 `architecture` 已有适配器则应直接跑；没有则加适配器，而不是改 `native.c` 里的 Qwen 分支当默认。
+后续加模型：复制 `examples/models/_template/` 与 `src/arch/_template.c`，见 `CONTRIBUTING.md`。禁止改 `native.c` 层循环当默认模型。
+
+### 2026-09-03：模块边界（开源贡献路径）
+
+- 架构插件：`src/arch/*.c` + `edgexpu_arch_register`；tensor 名模板离开 `native.c` 硬编码后缀。
+- Backend 分步 vtable：`load` / `tokenize` / `ensure_window` / `prefill` / `decode_step`；`cpu.native` 与 llama `generate` 分开。
+- Scheduler 资源预算：权重 mmap + KV + prefill scratch，超过设备 RAM 85% 拒绝 native load。
+- `CONTRIBUTING.md`、`examples/models/_template/`、`src/arch/_template.c`。
+- Qwen3.5 hybrid 仍是 plugin 识别 + 明确 unsupported，未实现 SSM 前向。
 
 ## 已完成记录
 

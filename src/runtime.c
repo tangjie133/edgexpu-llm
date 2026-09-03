@@ -333,11 +333,11 @@ static int load_model_job_callback(
         return 0;
     }
 
-    /* GGUF 先 native_load。成功则产品路径不依赖 llama-cli；llama 只作对照/bootstrap。 */
-    if (artifact_is_gguf(&runtime->manifest)) {
-        native_ok = edgexpu_native_load(
+    /* GGUF 先走当前 backend->load（cpu.native 时即 native_load）。成功则不依赖 llama-cli。 */
+    if (artifact_is_gguf(&runtime->manifest) && runtime->backend->load != NULL) {
+        native_ok = runtime->backend->load(
             &runtime->native,
-            runtime->manifest.primary_artifact.path,
+            &runtime->manifest,
             native_error,
             sizeof(native_error)
         );
@@ -351,8 +351,9 @@ static int load_model_job_callback(
         return 1;
     }
 
-    llama_ok = runtime->backend->load(&runtime->manifest, llama_error, sizeof(llama_error));
+    llama_ok = edgexpu_backend_cpu_baseline()->load(NULL, &runtime->manifest, llama_error, sizeof(llama_error));
     if (llama_ok) {
+        runtime->backend = edgexpu_backend_cpu_baseline();
         return 1;
     }
 
@@ -381,6 +382,14 @@ static int tokenize_job_callback(
         return 1;
     }
     prompt = context->request != NULL ? context->request->prompt : "";
+    if (context->runtime->backend != NULL && context->runtime->backend->tokenize != NULL) {
+        return context->runtime->backend->tokenize(
+            &context->runtime->native,
+            prompt,
+            error,
+            error_size
+        );
+    }
     return edgexpu_native_tokenize(&context->runtime->native, prompt, error, error_size);
 }
 
@@ -411,11 +420,21 @@ static int prefill_job_callback(
     n_new = context->request != NULL && context->request->max_tokens > 0
         ? context->request->max_tokens
         : 1;
-    if (!edgexpu_native_ensure_window(&runtime->native, tokens, n_new, error, error_size)) {
+    if (runtime->backend != NULL && runtime->backend->ensure_window != NULL) {
+        if (!runtime->backend->ensure_window(&runtime->native, tokens, n_new, error, error_size)) {
+            return 0;
+        }
+    } else if (!edgexpu_native_ensure_window(&runtime->native, tokens, n_new, error, error_size)) {
         return 0;
     }
     if (!cpu_path_is_llama(context->request) && runtime->native.output_norm != NULL) {
+        if (runtime->backend != NULL && runtime->backend->prefill != NULL) {
+            return runtime->backend->prefill(&runtime->native, error, error_size);
+        }
         return edgexpu_native_forward_prefill(&runtime->native, error, error_size);
+    }
+    if (runtime->backend != NULL && runtime->backend->reserve_kv != NULL) {
+        return runtime->backend->reserve_kv(&runtime->native, tokens, error, error_size);
     }
     return edgexpu_native_reserve_kv(&runtime->native, tokens, error, error_size);
 }
@@ -504,7 +523,20 @@ static int decode_job_callback(
             snprintf(context->result->backend, sizeof(context->result->backend), "cpu.native");
             context->result->prompt_tokens_approx = native->prompt_token_count;
         }
-        if (!edgexpu_native_generate_next(
+        if (context->runtime->backend != NULL && context->runtime->backend->decode_step != NULL) {
+            if (!context->runtime->backend->decode_step(
+                    native,
+                    temperature,
+                    top_p,
+                    &token,
+                    context->last_piece,
+                    sizeof(context->last_piece),
+                    &stopped,
+                    error,
+                    error_size)) {
+                return 0;
+            }
+        } else if (!edgexpu_native_generate_next(
                 native,
                 temperature,
                 top_p,
@@ -530,12 +562,13 @@ static int decode_job_callback(
         return 1;
     }
 
-    if (context->runtime->backend == NULL) {
-        set_error(error, error_size, "decode job 缺少 runtime backend");
+    if (context->runtime->backend == NULL || context->runtime->backend->generate == NULL) {
+        set_error(error, error_size, "decode job 缺少 runtime generate");
         return 0;
     }
 
     return context->runtime->backend->generate(
+        NULL,
         context->request,
         context->result,
         error,

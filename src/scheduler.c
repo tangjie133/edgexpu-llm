@@ -1,6 +1,8 @@
 #include "edgexpu/scheduler.h"
 
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* 按 job 类型填 backend/device/policy。native 就绪时 tokenize/prefill/decode 标 cpu.native。 */
@@ -192,23 +194,166 @@ const edgexpu_backend *edgexpu_scheduler_select_backend(
     char *error,
     size_t error_size
 ) {
-    const edgexpu_backend *cpu_backend;
-
     if (manifest == NULL) {
         set_error(error, error_size, "调度失败：manifest 为空");
         return NULL;
     }
 
-    /* 初版只选择 CPU baseline。
-     * 后续这里会扩展为按 prefill/decode/verification 分阶段选择 backend。
-     */
-    cpu_backend = edgexpu_backend_cpu_baseline();
-    if (manifest_supports_cpu_baseline(manifest)) {
-        return cpu_backend;
+    if (!manifest_supports_cpu_baseline(manifest)) {
+        set_error(error, error_size, "manifest 未声明当前支持的 backend");
+        return NULL;
     }
 
-    set_error(error, error_size, "manifest 未声明当前初版支持的 backend");
-    return NULL;
+    if (strcmp(manifest->primary_artifact.backend, "cpu.native") == 0) {
+        return edgexpu_backend_cpu_native();
+    }
+
+    return edgexpu_backend_cpu_baseline();
+}
+
+static size_t mul_size(size_t a, size_t b) {
+    if (a != 0 && b > (SIZE_MAX / a)) {
+        return SIZE_MAX;
+    }
+    return a * b;
+}
+
+void edgexpu_scheduler_estimate_native(
+    uint64_t file_size,
+    uint32_t block_count,
+    uint32_t n_kv_heads,
+    int head_dim,
+    uint32_t n_embd,
+    uint32_t n_ff,
+    uint32_t n_heads,
+    int window,
+    const edgexpu_device_profile *profile,
+    edgexpu_resource_plan *plan
+) {
+    size_t seq;
+    size_t per_pos;
+    size_t usable_mb;
+
+    if (plan == NULL) {
+        return;
+    }
+    memset(plan, 0, sizeof(*plan));
+    if (window < 1) {
+        window = 1;
+    }
+    if (head_dim <= 0 && n_embd > 0 && n_heads > 0) {
+        head_dim = (int)(n_embd / n_heads);
+    }
+    if (n_ff == 0 && n_embd > 0) {
+        n_ff = n_embd * 4u;
+    }
+    plan->window = window;
+    plan->weight_bytes = (size_t)file_size;
+    plan->kv_bytes = mul_size(
+        2u,
+        mul_size(
+            (size_t)block_count,
+            mul_size((size_t)n_kv_heads, mul_size((size_t)head_dim, mul_size((size_t)window, sizeof(float))))
+        )
+    );
+    seq = (size_t)window;
+    per_pos = (size_t)n_embd * 6u + (size_t)n_ff * 2u + (size_t)n_heads * (size_t)head_dim +
+        2u * (size_t)n_kv_heads * (size_t)head_dim;
+    plan->scratch_bytes = mul_size(seq, mul_size(per_pos, sizeof(float)));
+    if (plan->weight_bytes == SIZE_MAX || plan->kv_bytes == SIZE_MAX || plan->scratch_bytes == SIZE_MAX) {
+        plan->total_bytes = SIZE_MAX;
+    } else {
+        plan->total_bytes = plan->weight_bytes + plan->kv_bytes + plan->scratch_bytes;
+    }
+
+    if (getenv("EDGEXPU_BUDGET_DISABLE") != NULL) {
+        plan->limit_bytes = SIZE_MAX;
+        plan->admitted = 1;
+        snprintf(plan->reason, sizeof(plan->reason), "budget disabled by EDGEXPU_BUDGET_DISABLE");
+        return;
+    }
+
+    usable_mb = 0;
+    if (profile != NULL && profile->memory_total_mb > 0) {
+        usable_mb = (size_t)profile->memory_total_mb * 85u / 100u;
+    }
+    if (usable_mb == 0) {
+        plan->limit_bytes = 0;
+        plan->admitted = 1;
+        snprintf(plan->reason, sizeof(plan->reason), "device memory unknown; admit native load");
+        return;
+    }
+
+    plan->limit_bytes = usable_mb * 1024u * 1024u;
+    if (plan->total_bytes > plan->limit_bytes) {
+        plan->admitted = 0;
+        snprintf(
+            plan->reason,
+            sizeof(plan->reason),
+            "native budget %zu MB (weights %zu KV %zu scratch %zu window %d) exceeds %zu MB (85%% of %d MB RAM)",
+            plan->total_bytes / (1024u * 1024u),
+            plan->weight_bytes / (1024u * 1024u),
+            plan->kv_bytes / (1024u * 1024u),
+            plan->scratch_bytes / (1024u * 1024u),
+            window,
+            plan->limit_bytes / (1024u * 1024u),
+            profile->memory_total_mb
+        );
+        return;
+    }
+    plan->admitted = 1;
+    snprintf(
+        plan->reason,
+        sizeof(plan->reason),
+        "native budget %zu MB within %zu MB (window %d)",
+        plan->total_bytes / (1024u * 1024u),
+        plan->limit_bytes / (1024u * 1024u),
+        window
+    );
+}
+
+void edgexpu_scheduler_estimate_gguf(
+    const edgexpu_gguf_info *info,
+    const edgexpu_device_profile *profile,
+    int window,
+    edgexpu_resource_plan *plan
+) {
+    int head_dim = 0;
+    if (info == NULL) {
+        if (plan != NULL) {
+            memset(plan, 0, sizeof(*plan));
+        }
+        return;
+    }
+    head_dim = edgexpu_gguf_head_dim(info);
+    edgexpu_scheduler_estimate_native(
+        info->file_size,
+        info->block_count,
+        info->head_count_kv,
+        head_dim,
+        info->embedding_length,
+        info->feed_forward_length,
+        info->head_count,
+        window,
+        profile,
+        plan
+    );
+}
+
+int edgexpu_scheduler_admit(
+    const edgexpu_resource_plan *plan,
+    char *error,
+    size_t error_size
+) {
+    if (plan == NULL) {
+        set_error(error, error_size, "resource plan 为空");
+        return 0;
+    }
+    if (!plan->admitted) {
+        set_error(error, error_size, plan->reason[0] != '\0' ? plan->reason : "native load rejected by resource scheduler");
+        return 0;
+    }
+    return 1;
 }
 
 int edgexpu_scheduler_plan_job(

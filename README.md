@@ -42,8 +42,9 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 - 本地 OpenAI-compatible `/v1/models` 和 `/v1/chat/completions` server
 - streaming 请求会按每个 native token 发送 SSE chunk
 - Qwen2.5 0.5B 参考模型包，以及 SmolLM2-135M 替换验证包（只换 manifest）
-- GGUF `general.architecture` adapter（RoPE / QKV bias / FFN / tokenizer）
+- GGUF `general.architecture` 插件（`src/arch/`：qwen2、llama、qwen35 识别）
 - 模型包 `chat_template`，runtime 不写死 chat 标记
+- 贡献入口 `CONTRIBUTING.md` 与 `examples/models/_template/`
 - MVP 验证脚本 `scripts/verify_mvp.sh`
 
 本地 benchmark 路径已经用 GGUF 模型和 native CPU prefill/decode 验证通过。runtime 通过单线程 runnable executor queue 执行 load、tokenize、prefill、decode、KV cache、stream 和 telemetry job。`tokenize` 走 native GGUF BPE tokenizer；`prefill` 跑完全部 transformer 层并写入 KV；每个生成 token 对应一次 native `decode_step` 和一次 `stream_token`。`llama cli` 仅在 native session 未就绪时作为后备。benchmark 会输出 `backend_telemetry`（含 prefill/decode 分项时间）、queue summary、scheduler policy 和 `executor_trace`。
@@ -251,7 +252,7 @@ cmake --build build --config Release
 bash scripts/verify_mvp.sh
 ```
 
-日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。缺 GGUF 的包会跳过，不把 CI 钉死在某一个文件名上。
+日常只跑这一条，全程 `cpu.native`，不调用 llama.cpp。共享 prompt / n 在 `scripts/verify.locks`；各包 greedy id 在 `examples/models/<pack>/verify.lock`。缺 GGUF 的包会跳过，不把 CI 钉死在某一个文件名上。加模型或架构见 `CONTRIBUTING.md`。
 
 llama.cpp 只是可选对照，不进默认验证：
 

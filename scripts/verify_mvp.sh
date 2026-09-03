@@ -44,7 +44,15 @@ require_file() {
 
 run_pack_lock() {
     local pack_dir="$1"
+    if [[ "$(basename "${pack_dir}")" == "_template" ]]; then
+        echo "skip _template: contributor template"
+        return 0
+    fi
     if ! load_pack "${pack_dir}"; then
+        return 0
+    fi
+    if [[ "${PACK_NAME}" == "_template" ]]; then
+        echo "skip ${PACK_NAME}: contributor template"
         return 0
     fi
     if [[ ! -f "${pack_dir}/verify.lock" ]]; then
@@ -96,8 +104,12 @@ cmake --build "${BUILD_DIR}" --config Release
 stage "unit"
 require_contains "$("${BIN}" capabilities)" "\"runtimes\"" "capabilities"
 require_contains "$("${BIN}" capabilities)" "\"simd\"" "capabilities simd"
+require_contains "$("${BIN}" capabilities)" "\"arch_plugins\"" "capabilities arch plugins"
+require_contains "$("${BIN}" capabilities)" "\"cpu_native\": true" "capabilities cpu.native"
 require_contains "$("${BIN}" executor-selftest)" "executor selftest passed" "executor"
-require_contains "$("${BIN}" scheduler-selftest)" "scheduler selftest passed" "scheduler"
+SCHEDULER_OUTPUT="$("${BIN}" scheduler-selftest)"
+require_contains "${SCHEDULER_OUTPUT}" "scheduler selftest passed" "scheduler"
+require_contains "${SCHEDULER_OUTPUT}" "budget_reject=ok" "scheduler budget"
 require_contains "$("${BIN}" native-selftest)" "native selftest passed" "kernel native-selftest"
 
 stage "packs"
