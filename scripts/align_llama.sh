@@ -11,7 +11,6 @@ source "${ROOT_DIR}/scripts/verify.common.sh"
 BIN="${ROOT_DIR}/build/edgexpu"
 DEFAULT_GGUF=""
 for candidate in \
-    "${ROOT_DIR}/examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
     "${ROOT_DIR}/examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 do
     if [[ -f "${candidate}" ]]; then

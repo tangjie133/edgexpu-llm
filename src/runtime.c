@@ -323,9 +323,7 @@ static int load_model_job_callback(
 ) {
     edgexpu_runtime *runtime = (edgexpu_runtime *)user_data;
     char native_error[256] = {0};
-    char llama_error[256] = {0};
     int native_ok = 0;
-    int llama_ok = 0;
 
     (void)job;
     if (runtime == NULL || runtime->backend == NULL) {
@@ -333,7 +331,7 @@ static int load_model_job_callback(
         return 0;
     }
 
-    /* GGUF 先走当前 backend->load（cpu.native 时即 native_load）。成功则不依赖 llama-cli。 */
+    /* 产品路径只走 cpu.native。llama 仅 compare 显式 bootstrap，load 失败不改走 llama。 */
     if (artifact_is_gguf(&runtime->manifest) && runtime->backend->load != NULL) {
         native_ok = runtime->backend->load(
             &runtime->native,
@@ -343,27 +341,14 @@ static int load_model_job_callback(
         );
         if (!native_ok) {
             edgexpu_native_free(&runtime->native);
+            set_error(error, error_size, native_error[0] != '\0' ? native_error : "cpu.native 加载失败");
+            return 0;
         }
-    }
-
-    if (native_ok) {
         edgexpu_backend_cpu_baseline_bind(&runtime->manifest);
         return 1;
     }
 
-    llama_ok = edgexpu_backend_cpu_baseline()->load(NULL, &runtime->manifest, llama_error, sizeof(llama_error));
-    if (llama_ok) {
-        runtime->backend = edgexpu_backend_cpu_baseline();
-        return 1;
-    }
-
-    if (native_error[0] != '\0') {
-        set_error(error, error_size, native_error);
-    } else if (llama_error[0] != '\0') {
-        set_error(error, error_size, llama_error);
-    } else {
-        set_error(error, error_size, "模型加载失败：native 与 llama bootstrap 均不可用");
-    }
+    set_error(error, error_size, "模型加载失败：需要 GGUF 与 cpu.native");
     return 0;
 }
 
@@ -562,18 +547,17 @@ static int decode_job_callback(
         return 1;
     }
 
-    if (context->runtime->backend == NULL || context->runtime->backend->generate == NULL) {
-        set_error(error, error_size, "decode job 缺少 runtime generate");
-        return 0;
+    if (cpu_path_is_llama(context->request)) {
+        const edgexpu_backend *llama = edgexpu_backend_cpu_baseline();
+        if (llama == NULL || llama->generate == NULL) {
+            set_error(error, error_size, "llama bootstrap generate 不可用");
+            return 0;
+        }
+        return llama->generate(NULL, context->request, context->result, error, error_size);
     }
 
-    return context->runtime->backend->generate(
-        NULL,
-        context->request,
-        context->result,
-        error,
-        error_size
-    );
+    set_error(error, error_size, "cpu.native decode 未就绪；产品路径不回退 llama");
+    return 0;
 }
 
 static int collect_telemetry_job_callback(

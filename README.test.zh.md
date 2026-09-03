@@ -9,14 +9,67 @@
 | 第 3 轮 | 2026-09-03 ~10:15 | 第 2 轮 P2 修补回归 |
 | 第 4 轮 | 2026-09-03 ~10:50 | 树莓派 4 实机；发现 generate 依赖 llama（P0） |
 | 第 5 轮 | 2026-09-03 ~11:10 | P0 修复后：桌面无 llama PATH + 树莓派产品入口 |
-| **第 6 轮（本次）** | **2026-09-03 ~11:30** | **v0.0.7：native 成功不再探测 llama；NEON Q4_K；qemu 自动 emulated** |
+| 第 6 轮 | 2026-09-03 ~11:30 | v0.0.7：native 成功不再探测 llama；NEON Q4_K；qemu 自动 emulated |
+| **第 7 轮（本次）** | **2026-09-03 ~13:45** | **架构插件 / backend vtable / 资源预算 / 分包 verify.lock；Qwen3.5 识别但不做 native** |
 
 测试机（桌面）：Linux x86_64，Intel Core Ultra 9 285K。  
-测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM，根分区 `mmcblk0p2` ext4。仓库 `/home/a/Desktop/edgexpu-llm`（`feb32ac` v0.0.7）。板上 **无** llama-cli。本轮只记录，不改产品代码。
+测试机（板子）：**Raspberry Pi 4 Model B Rev 1.4**，aarch64，4 核 Cortex-A72，3.7Gi RAM。仓库 `/home/a/Desktop/edgexpu-llm`（`4d55ab7`）。板上 **无** llama-cli。本轮只记录，不改产品代码。
 
 ---
 
-## 0. 第 6 轮结论（v0.0.7）
+## 0. 第 7 轮结论（`4d55ab7` 修改框架）
+
+新框架按 `CONTRIBUTING.md` 拆开了三层：**模型包**（`examples/models/<pack>/` + `verify.lock`）、**架构插件**（`src/arch/*.c`）、**backend vtable**（`cpu.native` 分步 vs llama 一次性 `generate`）。scheduler 按 mmap 权重 + KV + scratch 估预算，超过设备 RAM **85%** 拒绝 native load。Qwen3.5 hybrid **只识别、不跑 cpu.native**。
+
+官方入口：桌面 `verify_mvp.sh` **通过**；ARM qemu unit **通过**；树上莓派 `verify_arm.sh` greedy **通过**（0.5B）。
+
+| 项 | 结果 |
+| --- | --- |
+| 桌面 `verify_mvp.sh` | **通过**。skip 缺 GGUF 的 0.5B；Qwen3.5 `NATIVE=0` 只锁 tokenize；**产品包变成 SmolLM** |
+| `capabilities` | `arch_plugins=["qwen2","llama","qwen35"]`，`cpu_native=true`；板上 `cpu_baseline=false` |
+| `scheduler-selftest` | 桌面 / 板 **budget_reject=ok budget_admit=ok** |
+| Qwen3.5 `inspect-gguf` | `architecture=qwen35`，`native_adapter=unsupported`，报错含 Attention+SSM |
+| Qwen3.5 tokenize `Hello EdgeXPU` | **MATCH** `9419,10041,55,6126`，roundtrip |
+| Qwen3.5 `dump-logits` / `native-selftest` | **拒绝**（同上 adapter 错误），未误跑层循环 |
+| Qwen3.5 `generate` 无 llama | **失败**：要 `llama-cli`（包声明 `cpu.baseline`，符合设计） |
+| Qwen3.5 `generate` 有 llama（桌面 n=1） | **通过** `backend=cpu.baseline`，文本以 `[Start thinking]` 开头（thinking 模型） |
+| 桌面 SmolLM n=32 | decode **81.0** / prefill **219.6** tok/s，mem 111MB；2+2 **答不出**（135M） |
+| 板上 0.5B generate / HTTP | **`4` / `stop` / `cpu.native`** |
+| 板上 4B 预算 | **`budget_admitted=0`** total_mb=4351 limit_mb=3226（3.7Gi×85%） |
+| 板上 greedy | **MATCH**（0.5B）；skip SmolLM（无 GGUF） |
+| `EDGEXPU_ARM_FULL=1`（x86） | **假绿**：`load_pack` 直接跑 aarch64 `BIN`，inspect-manifest 失败，锁点全 skip，脚本仍打印 passed |
+
+### 框架行为对得上计划的部分
+
+1. 插件登记可见；`_template` 被 CI skip；CMake 未链 `_template.c`。
+2. 缺 GGUF 的包 skip，不把桌面 CI 打红（0.5B 权重仍不在桌面包目录）。
+3. hybrid 有明确 unsupported，没有 silently 当 qwen2 跑。
+4. 4B 在 Pi 上被预算挡住，inspect 4.2G 文件后 available 仍约 3.3Gi，swap 未用。
+5. artifact `backend=cpu.native` → native；`cpu.baseline` → llama 后备。
+
+### P1
+
+1. **x86 上 `EDGEXPU_ARM_FULL=1` 锁点被跳过仍报通过。** `scripts/verify.common.sh` 的 `load_pack` 用 `${BIN} inspect-manifest` 解析 GGUF 路径，而 `verify_arm.sh` 的 `BIN` 是交叉编译的 aarch64 文件。未走 `run_bin`（qemu `-L` sysroot）时，`qemu-aarch64-static` 打不开 `/lib/ld-linux-aarch64.so.1`，路径为空，所有 native 包 `skip missing GGUF`。unit 段是绿的，**greedy 段是空跑**。板上本机不受影响。建议：`load_pack` 在交叉场景用 qemu 包一层，或用 JSON 直接读 artifact.path，不要依赖对 aarch64 二进制的裸 exec。
+
+2. **桌面参考包 0.5B GGUF 仍缺失**，4B 权重放在 `examples/models/qwen2.5-0.5b/Qwen3.5-4B-Q8_0.gguf`。`verify_mvp.sh` 因此把 **SmolLM 135M** 当成 generate/HTTP 产品包。CI 绿，但不能再验收 2+2→4。板上 0.5B 还在。建议：0.5B 文件名放回原包；4B 只放在 `qwen3.5-4b/`。
+
+### P2
+
+1. Qwen3.5 manifest 用 `../qwen2.5-0.5b/Qwen3.5-4B-Q8_0.gguf`，包边界不清。
+2. manifest `context_length=8192`，GGUF `context_length=262144`。
+3. chat_template 仍是 Qwen2 `<|im_start|>`；llama 生成出现 thinking 标记，模板可能不对齐 Qwen3.5。
+4. 板上无 llama，Qwen3.5 **不能**作为板上产品入口（包设计如此）。不要和「默认 cpu.native」混为一谈。
+5. 板上仍无 SmolLM GGUF。NPU / Windows / soak 未测。executor 仍单线程。
+
+### 第 7 轮建议（给开发，测试不改代码）
+
+1. 修 `verify_arm.sh` FULL 路径的 `load_pack`，避免 skip 当通过。
+2. 把 4B GGUF 挪到自己的包目录，桌面补回 0.5B，让 CI 产品包回到 Coder 0.5B。
+3. Qwen3.5 在文档里写清：tokenize + llama 后备；**不是** native 参考包。
+
+---
+
+## 0a. 第 6 轮结论（v0.0.7，归档）
 
 对照第 5 轮剩余项：native 成功后 **不再** 调用 llama `backend->load()`，改为 `edgexpu_backend_cpu_baseline_bind()` 后直接返回。`verify_mvp.sh` 已锁「空 PATH generate」。板上空 PATH `generate` 仍出 `4` / `cpu.native`。
 
@@ -60,7 +113,7 @@
 
 ---
 
-## 0a. 第 5 轮结论（P0 回归，归档）
+## 0c. 第 5 轮结论（P0 回归，归档）
 
 
 第 4 轮 P0 **已关闭**。GGUF load 先 `native_load`，native 成功则不再要求 llama。桌面把 PATH 去掉 `/usr/local/bin`（llama-cli 所在）后 `generate` 仍出 `4`。板上无 llama，`generate` / `benchmark` / `serve` 全部可用，`backend=cpu.native`。
@@ -228,10 +281,11 @@ verify_arm.sh 走后者，unit 绿；FULL greedy 锁点绿（需 0.5B GGUF）
 
 ## 5. 建议
 
-1. 第 5–6 轮已关 P0。板上 tok/s 仅记录（第 6 轮 decode 8.61）；不要拿它和桌面 55 tok/s 或 llama 比达标。
+1. 第 5–6 轮已关 P0。板上 tok/s 仅记录；不要拿它和桌面或 llama 比达标。
 2. qemu-user 现在会自动标 `emulated=true`；`verify_arm.sh` 仍会设 `EDGEXPU_EMULATED=1`。
 3. 不要把第 3 轮桌面满载 9–20 tok/s 写进计划当回归。
-4. 不要把非 0.5B 权重下载进 `examples/models/qwen2.5-0.5b/`，桌面 `verify_mvp.sh` 认的是旧文件名。
+4. 4B 权重量放到 `qwen3.5-4b/`；桌面补回 0.5B 文件名，否则 CI 产品包会变成 SmolLM。
+5. x86 上 `EDGEXPU_ARM_FULL=1` 必须真正跑到 dump-logits，不能 skip 当通过。
 
 ---
 

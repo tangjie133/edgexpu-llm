@@ -6,7 +6,7 @@
   "supported_tasks": ["chat"],
   "memory_required_mb": 512,
   "kv_cache_required_mb": 256,
-  "fallback_policy": "cpu.baseline",
+  "fallback_policy": "cpu.native",
   "chat_template": "{{#system}}<|im_start|>system\n{{content}}<|im_end|>\n{{/system}}{{#message}}<|im_start|>{{role}}\n{{content}}<|im_end|>\n{{/message}}<|im_start|>assistant\n",
   "artifacts": [
     {

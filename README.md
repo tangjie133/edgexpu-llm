@@ -10,7 +10,7 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 
 `llama.cpp` 只是临时方案。
 
-当前 MVP 使用 `llama.cpp` 或兼容工具作为 CPU bootstrap backend，目的是先验证 CLI、模型 manifest、benchmark 输出、本地 API 形态和基础 runtime 流程。在 native executor 成熟之前，它是一个方便的临时执行后端。
+当前产品路径一律 `cpu.native`。`llama.cpp` 只用于 `compare` / `align_llama.sh` 数值对照，不是某一类模型的正式执行后端。尚未实现的架构必须报错并补 plugin，不能改走 llama。
 
 长期目标是用 EdgeXPU 自己的运行时替代 shell-out 推理，逐步实现：
 
@@ -41,7 +41,7 @@ EdgeXPU-LLM 是一个面向边缘设备的离线 LLM 推理运行时。它的目
 - backend-owned telemetry 第一版，并已作为下一次 scheduler plan 的输入
 - 本地 OpenAI-compatible `/v1/models` 和 `/v1/chat/completions` server
 - streaming 请求会按每个 native token 发送 SSE chunk
-- Qwen2.5 0.5B 参考模型包，以及 SmolLM2-135M 替换验证包（只换 manifest）
+- SmolLM2-135M native 参考包；Qwen3.5-4B 走同一套 cpu.native 契约（SSM 前向尚未实现）
 - GGUF `general.architecture` 插件（`src/arch/`：qwen2、llama、qwen35 识别）
 - 模型包 `chat_template`，runtime 不写死 chat 标记
 - 贡献入口 `CONTRIBUTING.md` 与 `examples/models/_template/`
@@ -244,6 +244,15 @@ MVP 要保持小而可验证。
 - 模型转换 pipeline
 - distributed serving
 
+## 参考模型包
+
+| 目录 | 角色 |
+| --- | --- |
+| `examples/models/smollm2-135m/` | **native 参考包**（adapter=`llama`）。`cpu.native`；greedy n=4 锁在该目录 `verify.lock`。135M 质量有限，不要用 2+2→4 当能力验收。 |
+| `examples/models/qwen3.5-4b/` | 同一套 `cpu.native` 契约。hybrid Attention+SSM **尚未实现**，所以 CI 只锁 tokenize；`generate` 会报缺 adapter，不改走 llama。GGUF context 262144，包内 `context_length=8192` 是边缘调度窗。Pi 4GB 会被资源预算拒绝 mmap。 |
+
+加包方式见 `CONTRIBUTING.md`。不要把其它权重塞进已删除的 Qwen2.5-0.5B 目录。
+
 ## 构建和验证
 
 ```bash
@@ -276,13 +285,13 @@ bash scripts/verify_arm.sh                                # 交叉编译 + qemu 
 调试 native 前向（默认 greedy n=8；锁点用 n=4）：
 
 ```bash
-./build/edgexpu dump-logits examples/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf "Hello EdgeXPU" 4
+./build/edgexpu dump-logits examples/models/smollm2-135m/SmolLM2-135M-Instruct-Q4_K_M.gguf "Hello EdgeXPU" 4
 ```
 
 本地 API：
 
 ```bash
-./build/edgexpu serve examples/models/qwen2.5-0.5b/model.manifest.json 8000
+./build/edgexpu serve examples/models/smollm2-135m/model.manifest.json 8000
 curl http://127.0.0.1:8000/v1/models
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \

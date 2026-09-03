@@ -204,11 +204,8 @@ const edgexpu_backend *edgexpu_scheduler_select_backend(
         return NULL;
     }
 
-    if (strcmp(manifest->primary_artifact.backend, "cpu.native") == 0) {
-        return edgexpu_backend_cpu_native();
-    }
-
-    return edgexpu_backend_cpu_baseline();
+    /* 产品执行只选 cpu.native。llama 不由 scheduler 作为某一类模型的正式 backend。 */
+    return edgexpu_backend_cpu_native();
 }
 
 static size_t mul_size(size_t a, size_t b) {

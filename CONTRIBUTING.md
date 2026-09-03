@@ -7,8 +7,8 @@ EdgeXPU-LLM 是边缘离线 LLM runtime。开源后请按层改代码，不要�
 | 你想做的事 | 改这些 | 不要改 |
 | --- | --- | --- |
 | 换一个已支持架构的 GGUF | `examples/models/<pack>/`（manifest、GGUF、`verify.lock`、chat_template） | runtime / native forward |
-| 新 GGUF `general.architecture`（仍是 dense MHA+SwiGLU） | 复制 `src/arch/_template.c` → `src/arch/<id>.c`，在 `src/arch/register.c` 的 `edgexpu_arch_init` 里登记 | `src/native.c` |
-| hybrid / SSM / MoE / fused QKV | 先加 plugin 且 `native_forward=0` 或 `layer_kind=UNSUPPORTED`；实现 kernel 后再打开 | 把 Qwen 特判写进 runtime |
+| 新 GGUF `general.architecture` | 复制 `src/arch/_template.c` → `src/arch/<id>.c`，实现 `native_forward=1` 的层，在 `register.c` 登记 | 改走 llama `cpu.baseline` 当产品路径 |
+| hybrid / SSM / MoE / fused QKV | 同一套 plugin + kernel；未实现前 `generate` 报错 | 把「暂不支持」写成 llama 后备 |
 | 新执行后端（RKLLM / QNN） | 新文件实现 `edgexpu_backend` 分步 vtable（`load` / `prefill` / `decode_step`），在 `edgexpu_scheduler_select_backend` 里按 manifest `backend` 选择 | 只在 scheduler 里加字符串、没有 .c |
 | tokenizer 不是 GPT-2 BPE | 新 tokenizer 实现 + plugin `configure` 里拒绝或接线 | 假设所有模型都是 gpt2 |
 
@@ -21,7 +21,11 @@ EdgeXPU-LLM 是边缘离线 LLM runtime。开源后请按层改代码，不要�
 - 共享 prompt：`scripts/verify.locks`（`PROMPT` / `GREEDY_N`）
 - 缺 GGUF 时 `scripts/verify_mvp.sh` 会 skip 该包，不会红
 
-`NATIVE=1` 要求 `cpu.native` 能 dump-logits。`NATIVE=0` 只锁 tokenize（例如尚未实现的 hybrid）。
+产品执行**一律** `cpu.native`。llama.cpp 只给 `compare` / `align_llama.sh` 对照，不是某一类模型的正式后端。
+
+`NATIVE=1`：CI 锁 dump-logits（native 已能跑）。`NATIVE=0`：架构插件还未完成前向，CI 只锁 tokenize；`generate` 应失败并指出缺 adapter，**不得**改走 llama。
+
+Qwen3.5 目前是 `NATIVE=0`：能分词，还不能自研 SSM 前向。缺口是实现 `src/arch/qwen35` 的层，而不是声明 `cpu.baseline`。
 
 ## 架构插件
 
@@ -33,7 +37,7 @@ EdgeXPU-LLM 是边缘离线 LLM runtime。开源后请按层改代码，不要�
 
 ## Backend 插件
 
-`include/edgexpu/backend.h`：`engine` 对 `cpu.native` 是 `edgexpu_native_session *`。llama bootstrap 只实现 `load` + `generate`，分步函数为 NULL。
+`include/edgexpu/backend.h`：产品 backend 是 `cpu.native` 的分步接口。llama bootstrap 只给 `edgexpu compare` 用。
 
 ## 资源调度
 

@@ -84,6 +84,7 @@ run_pack_lock() {
             NATIVE_MODEL_ID="${MODEL_ID}"
         fi
     else
+        require_contains "$("${BIN}" inspect-manifest "${MANIFEST}")" "artifact.backend: cpu.native" "${PACK_NAME} native artifact"
         require_contains "$("${BIN}" inspect-gguf "${GGUF}")" "native_adapter=unsupported" "${PACK_NAME} inspect-gguf"
         TOKENIZE_OUTPUT="$("${BIN}" tokenize "${GGUF}" "${PROMPT}")"
         require_contains "${TOKENIZE_OUTPUT}" "decoded=${PROMPT}" "${PACK_NAME} tokenize"
@@ -162,7 +163,7 @@ WRONG_MODEL="$(curl -sS "http://127.0.0.1:${PORT}/v1/chat/completions" \
 require_contains "${WRONG_MODEL}" "edgexpu_error" "model mismatch"
 require_contains "${WRONG_MODEL}" "does not match" "model mismatch message"
 STREAM_BODY="$(mktemp)"
-sed "s/qwen2.5-0.5b/${NATIVE_MODEL_ID}/g" "${STREAM_REQUEST}" >"${STREAM_BODY}"
+sed "s/smollm2-135m/${NATIVE_MODEL_ID}/g" "${STREAM_REQUEST}" >"${STREAM_BODY}"
 STREAM_OUTPUT="$(curl -fs "http://127.0.0.1:${PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" -d @"${STREAM_BODY}")"
 rm -f "${STREAM_BODY}"

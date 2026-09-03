@@ -142,29 +142,125 @@ edgexpu/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu.dir/build.make CMakeFiles/edgexpu.dir/build
 .PHONY : edgexpu/fast
 
-src/arch.o: src/arch.c.o
-.PHONY : src/arch.o
+src/arch/llama.o: src/arch/llama.c.o
+.PHONY : src/arch/llama.o
 
 # target to build an object file
-src/arch.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch.c.o
-.PHONY : src/arch.c.o
+src/arch/llama.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/llama.c.o
+.PHONY : src/arch/llama.c.o
 
-src/arch.i: src/arch.c.i
-.PHONY : src/arch.i
+src/arch/llama.i: src/arch/llama.c.i
+.PHONY : src/arch/llama.i
 
 # target to preprocess a source file
-src/arch.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch.c.i
-.PHONY : src/arch.c.i
+src/arch/llama.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/llama.c.i
+.PHONY : src/arch/llama.c.i
 
-src/arch.s: src/arch.c.s
-.PHONY : src/arch.s
+src/arch/llama.s: src/arch/llama.c.s
+.PHONY : src/arch/llama.s
 
 # target to generate assembly for a file
-src/arch.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch.c.s
-.PHONY : src/arch.c.s
+src/arch/llama.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/llama.c.s
+.PHONY : src/arch/llama.c.s
+
+src/arch/qwen2.o: src/arch/qwen2.c.o
+.PHONY : src/arch/qwen2.o
+
+# target to build an object file
+src/arch/qwen2.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/qwen2.c.o
+.PHONY : src/arch/qwen2.c.o
+
+src/arch/qwen2.i: src/arch/qwen2.c.i
+.PHONY : src/arch/qwen2.i
+
+# target to preprocess a source file
+src/arch/qwen2.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/qwen2.c.i
+.PHONY : src/arch/qwen2.c.i
+
+src/arch/qwen2.s: src/arch/qwen2.c.s
+.PHONY : src/arch/qwen2.s
+
+# target to generate assembly for a file
+src/arch/qwen2.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/qwen2.c.s
+.PHONY : src/arch/qwen2.c.s
+
+src/arch/qwen35.o: src/arch/qwen35.c.o
+.PHONY : src/arch/qwen35.o
+
+# target to build an object file
+src/arch/qwen35.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/qwen35.c.o
+.PHONY : src/arch/qwen35.c.o
+
+src/arch/qwen35.i: src/arch/qwen35.c.i
+.PHONY : src/arch/qwen35.i
+
+# target to preprocess a source file
+src/arch/qwen35.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/qwen35.c.i
+.PHONY : src/arch/qwen35.c.i
+
+src/arch/qwen35.s: src/arch/qwen35.c.s
+.PHONY : src/arch/qwen35.s
+
+# target to generate assembly for a file
+src/arch/qwen35.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/qwen35.c.s
+.PHONY : src/arch/qwen35.c.s
+
+src/arch/register.o: src/arch/register.c.o
+.PHONY : src/arch/register.o
+
+# target to build an object file
+src/arch/register.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/register.c.o
+.PHONY : src/arch/register.c.o
+
+src/arch/register.i: src/arch/register.c.i
+.PHONY : src/arch/register.i
+
+# target to preprocess a source file
+src/arch/register.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/register.c.i
+.PHONY : src/arch/register.c.i
+
+src/arch/register.s: src/arch/register.c.s
+.PHONY : src/arch/register.s
+
+# target to generate assembly for a file
+src/arch/register.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/register.c.s
+.PHONY : src/arch/register.c.s
+
+src/arch/tensors.o: src/arch/tensors.c.o
+.PHONY : src/arch/tensors.o
+
+# target to build an object file
+src/arch/tensors.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/tensors.c.o
+.PHONY : src/arch/tensors.c.o
+
+src/arch/tensors.i: src/arch/tensors.c.i
+.PHONY : src/arch/tensors.i
+
+# target to preprocess a source file
+src/arch/tensors.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/tensors.c.i
+.PHONY : src/arch/tensors.c.i
+
+src/arch/tensors.s: src/arch/tensors.c.s
+.PHONY : src/arch/tensors.s
+
+# target to generate assembly for a file
+src/arch/tensors.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/arch/tensors.c.s
+.PHONY : src/arch/tensors.c.s
 
 src/backend.o: src/backend.c.o
 .PHONY : src/backend.o
@@ -189,6 +285,30 @@ src/backend.s: src/backend.c.s
 src/backend.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/backend.c.s
 .PHONY : src/backend.c.s
+
+src/backend_native.o: src/backend_native.c.o
+.PHONY : src/backend_native.o
+
+# target to build an object file
+src/backend_native.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/backend_native.c.o
+.PHONY : src/backend_native.c.o
+
+src/backend_native.i: src/backend_native.c.i
+.PHONY : src/backend_native.i
+
+# target to preprocess a source file
+src/backend_native.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/backend_native.c.i
+.PHONY : src/backend_native.c.i
+
+src/backend_native.s: src/backend_native.c.s
+.PHONY : src/backend_native.s
+
+# target to generate assembly for a file
+src/backend_native.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edgexpu_runtime.dir/build.make CMakeFiles/edgexpu_runtime.dir/src/backend_native.c.s
+.PHONY : src/backend_native.c.s
 
 src/chat.o: src/chat.c.o
 .PHONY : src/chat.o
@@ -560,12 +680,27 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... edgexpu"
 	@echo "... edgexpu_runtime"
-	@echo "... src/arch.o"
-	@echo "... src/arch.i"
-	@echo "... src/arch.s"
+	@echo "... src/arch/llama.o"
+	@echo "... src/arch/llama.i"
+	@echo "... src/arch/llama.s"
+	@echo "... src/arch/qwen2.o"
+	@echo "... src/arch/qwen2.i"
+	@echo "... src/arch/qwen2.s"
+	@echo "... src/arch/qwen35.o"
+	@echo "... src/arch/qwen35.i"
+	@echo "... src/arch/qwen35.s"
+	@echo "... src/arch/register.o"
+	@echo "... src/arch/register.i"
+	@echo "... src/arch/register.s"
+	@echo "... src/arch/tensors.o"
+	@echo "... src/arch/tensors.i"
+	@echo "... src/arch/tensors.s"
 	@echo "... src/backend.o"
 	@echo "... src/backend.i"
 	@echo "... src/backend.s"
+	@echo "... src/backend_native.o"
+	@echo "... src/backend_native.i"
+	@echo "... src/backend_native.s"
 	@echo "... src/chat.o"
 	@echo "... src/chat.i"
 	@echo "... src/chat.s"

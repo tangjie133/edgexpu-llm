@@ -6,7 +6,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT_DIR}/build/edgexpu"
-MANIFEST="${1:-${ROOT_DIR}/examples/models/qwen2.5-0.5b/model.manifest.json}"
+MANIFEST="${1:-${ROOT_DIR}/examples/models/smollm2-135m/model.manifest.json}"
 PROMPT="${2:-Explain EdgeXPU-LLM briefly.}"
 N="${3:-32}"
 LLAMA_BIN_DIR="${LLAMA_BIN_DIR:-/home/tj/Desktop/llama.cpp/build/bin}"

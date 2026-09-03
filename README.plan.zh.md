@@ -12,7 +12,7 @@
 
 ## 参考模型 vs 可替换模型包
 
-EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是当前的 **reference model pack**：用来把 manifest、executor、native GGUF 路径和验证脚本跑通。用户必须能换成别的 GGUF / 别的架构 / 别的后端 artifact，而不改 runtime 核心。
+EdgeXPU-LLM **不是**某一个 GGUF 专用推理器。当前仓库里的 **native 参考包** 是 `examples/models/smollm2-135m/`。用户必须能换成别的 GGUF / 别的架构 / 别的后端 artifact，而不改 runtime 核心。
 
 分层：
 
@@ -20,7 +20,7 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 - **模型包**（随模型变）：`model.manifest.json`、artifact 路径、量化格式、可选 chat template。
 - **架构适配器**（按 GGUF `general.architecture` 或 manifest `family` 选择）：RoPE 类型、是否 Q/K bias、FFN 形态、tokenizer 类型、chat template。
 - **Kernel / 量化**（通用，按模型需要的子集启用）：RMSNorm、matmul、Q4_K 等。
-- **设备 backend**（按 artifact `backend` 选择）：CPU native、llama 后备、NPU/dNPU。
+- **设备 backend**（按 artifact `backend` 选择）：产品路径 `cpu.native`；NPU/dNPU；llama 仅 `compare`。
 
 当前实现里已经按 GGUF 读 `block_count` / `embedding_length` / KV 头数，层数不是写死 24。native forward 由 `general.architecture` 选择 adapter（当前：`qwen2`、`llama`/`mistral`）：RoPE 类型、Q/K/V bias、FFN=SwiGLU、GPT-2 BPE。chat template 在模型包 manifest，支持 `{{prompt}}` / `{{system}}` / `{{#system}}` / `{{#message}}`。runtime 不写死 `<|im_start|>`。换 Phi / Qwen3 仍需新 adapter，而不是改 `native.c` 里的默认分支。
 
@@ -34,7 +34,8 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 - Backend 分步 vtable：`load` / `tokenize` / `ensure_window` / `prefill` / `decode_step`；`cpu.native` 与 llama `generate` 分开。
 - Scheduler 资源预算：权重 mmap + KV + prefill scratch，超过设备 RAM 85% 拒绝 native load。
 - `CONTRIBUTING.md`、`examples/models/_template/`、`src/arch/_template.c`。
-- Qwen3.5 hybrid 仍是 plugin 识别 + 明确 unsupported，未实现 SSM 前向。
+- Qwen3.5 hybrid 已登记 plugin，SSM 前向未实现：产品仍声明 `cpu.native`，load/generate 失败而不是改走 llama。CI `NATIVE=0` 只锁 tokenize。
+- `verify_arm.sh` 的 pack 元数据从 JSON 读路径，交叉编译的 aarch64 `edgexpu` 不再被裸 exec；`EDGEXPU_ARM_FULL=1` 在有 native GGUF 却 0 次 dump-logits 时失败，禁止 skip 当通过。
 
 ## 已完成记录
 
@@ -181,7 +182,7 @@ EdgeXPU-LLM **不是** Qwen2.5-0.5B 专用推理器。Qwen2.5-0.5B GGUF 只是�
 
 ### 尺子 A：桌面 CPU fallback（必须够用，不必赢）
 
-平台：x86 Linux，参考包 Qwen2.5-0.5B。
+平台：x86 Linux，native 参考包 SmolLM2-135M。
 
 | 项 | 标准 |
 | --- | --- |
@@ -430,7 +431,7 @@ bash scripts/verify_arm.sh
 ## 追溯规则
 
 - 重要方向变更写入本文件。
-- Runtime 必须可替换模型；Qwen2.5-0.5B 只是 reference pack，禁止把单一模型的 chat/RoPE/层数写进核心路径。
+- Runtime 必须可替换模型；禁止把单一模型的 chat/RoPE/层数写进核心路径。
 - 追上 llama.cpp CPU tok/s 不是阶段完成条件；CPU fallback 与边缘产品用两根尺子，见「CPU fallback 验收标准」。
 - 已验证的命令写入本文件。
 - 临时方案必须标注“临时”以及未来替换路径。

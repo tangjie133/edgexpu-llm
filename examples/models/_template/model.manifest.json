@@ -7,7 +7,7 @@
   "supported_tasks": ["chat"],
   "memory_required_mb": 512,
   "kv_cache_required_mb": 256,
-  "fallback_policy": "cpu.baseline",
+  "fallback_policy": "cpu.native",
   "chat_template": "{{prompt}}",
   "artifacts": [
     {

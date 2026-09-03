@@ -7,12 +7,12 @@
   "supported_tasks": ["chat"],
   "memory_required_mb": 8192,
   "kv_cache_required_mb": 2048,
-  "fallback_policy": "cpu.baseline",
-  "chat_template": "{{#system}}<|im_start|>system\n{{content}}<|im_end|>\n{{/system}}{{#message}}<|im_start|>{{role}}\n{{content}}<|im_end|>\n{{/message}}<|im_start|>assistant\n",
+  "fallback_policy": "cpu.native",
+  "chat_template": "{{#system}}<|im_start|>system\n{{content}}<|im_end|>\n{{/system}}{{#message}}<|im_start|>{{role}}\n{{content}}<|im_end|>\n{{/message}}<|im_start|>assistant\n<think>\n\n</think>\n\n",
   "artifacts": [
     {
-      "backend": "cpu.baseline",
-      "path": "../qwen2.5-0.5b/Qwen3.5-4B-Q8_0.gguf",
+      "backend": "cpu.native",
+      "path": "Qwen3.5-4B-Q8_0.gguf",
       "format": "gguf",
       "quantization": "Q8_0",
       "command": "llama",

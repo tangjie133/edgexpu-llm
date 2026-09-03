@@ -82,6 +82,7 @@ require_contains "${UNIT}" "native selftest passed" "kernel native-selftest"
 
 if [[ "${EDGEXPU_ARM_FULL:-0}" == "1" || "${HOST_ARCH}" == "aarch64" || "${HOST_ARCH}" == "arm64" ]]; then
     LOCKED=0
+    NATIVE_GGUF=0
     while IFS= read -r pack_dir; do
         if [[ "$(basename "${pack_dir}")" == "_template" ]]; then
             continue
@@ -96,6 +97,7 @@ if [[ "${EDGEXPU_ARM_FULL:-0}" == "1" || "${HOST_ARCH}" == "aarch64" || "${HOST_
             echo "skip ${PACK_NAME}: missing GGUF ${GGUF}"
             continue
         fi
+        NATIVE_GGUF=$((NATIVE_GGUF + 1))
         echo "== ${PACK_NAME} greedy lock (mmap GGUF) =="
         SELF="$(run_bin "${BIN}" native-selftest "${GGUF}")"
         require_contains "${SELF}" "simd=neon" "${PACK_NAME} simd"
@@ -105,6 +107,9 @@ if [[ "${EDGEXPU_ARM_FULL:-0}" == "1" || "${HOST_ARCH}" == "aarch64" || "${HOST_
         check_dump_lock "${DUMP}" "${PROMPT_IDS}" "${GREEDY_IDS}" "${PACK_NAME} dump-logits"
         LOCKED=$((LOCKED + 1))
     done < <(each_pack_dir)
+    if [[ "${NATIVE_GGUF}" -gt 0 && "${LOCKED}" -ne "${NATIVE_GGUF}" ]]; then
+        die "native GGUF present (${NATIVE_GGUF}) but greedy locks ran ${LOCKED}; do not treat skip as pass"
+    fi
     if [[ "${LOCKED}" -lt 1 ]]; then
         echo "skip GGUF greedy lock: no native pack with GGUF + verify.lock"
     else

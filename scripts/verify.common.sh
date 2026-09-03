@@ -1,10 +1,16 @@
 # Shared helpers for verify_mvp.sh / verify_arm.sh / align_llama.sh
 # Per-pack numerical locks: examples/models/<pack>/verify.lock
-# Caller must set ROOT_DIR. BIN is required for load_pack / pack_gguf_path.
+# Caller must set ROOT_DIR. Pack metadata is read from JSON (no exec of BIN),
+# so cross-compiled aarch64 edgexpu is not required to resolve GGUF paths.
 # shellcheck source=verify.locks
 source "${ROOT_DIR}/scripts/verify.locks"
 
 MODELS_DIR="${ROOT_DIR}/examples/models"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "verification failed: python3 is required to read model.manifest.json" >&2
+    exit 1
+fi
 
 die() {
     echo "verification failed: $*" >&2
@@ -58,14 +64,34 @@ check_dump_lock() {
 
 pack_gguf_path() {
     local manifest="$1"
-    local line
-    line="$("${BIN}" inspect-manifest "${manifest}" | sed -n 's/^artifact.path: //p')"
-    printf '%s' "${line}"
+    local dir rel
+    dir="$(cd "$(dirname "${manifest}")" && pwd)"
+    rel="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    m = json.load(f)
+arts = m.get("artifacts") or []
+print(arts[0]["path"] if arts else "")
+' "${manifest}")"
+    if [[ -z "${rel}" ]]; then
+        printf ''
+        return 0
+    fi
+    if [[ "${rel}" = /* ]]; then
+        printf '%s' "${rel}"
+    else
+        python3 -c 'import os,sys; print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))' "${dir}" "${rel}"
+    fi
 }
 
 pack_model_id() {
     local manifest="$1"
-    "${BIN}" inspect-manifest "${manifest}" | sed -n 's/^model_id: //p'
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    m = json.load(f)
+print(m.get("model_id") or "")
+' "${manifest}"
 }
 
 # Sets: PACK_DIR PACK_NAME MANIFEST GGUF MODEL_ID ADAPTER NATIVE PROMPT_IDS GREEDY_IDS MANIFEST_CONTAINS

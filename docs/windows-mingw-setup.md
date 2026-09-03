@@ -97,13 +97,13 @@ Inspect local capabilities:
 Inspect a model manifest:
 
 ```powershell
-.\build\edgexpu.exe inspect-manifest examples\models\qwen2.5-0.5b\model.manifest.json
+.\build\edgexpu.exe inspect-manifest examples\models\smollm2-135m\model.manifest.json
 ```
 
 Start the local API server:
 
 ```powershell
-.\build\edgexpu.exe serve examples\models\qwen2.5-0.5b\model.manifest.json 8000
+.\build\edgexpu.exe serve examples\models\smollm2-135m\model.manifest.json 8000
 ```
 
 ## Common Problems
